@@ -60,3 +60,4 @@ tzdata==2025.2
 urllib3==2.5.0
 watchdog==6.0.0
 xyzservices==2025.4.0
+pytest==8.4.2

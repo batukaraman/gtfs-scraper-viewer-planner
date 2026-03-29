@@ -1,12 +1,12 @@
-import requests
 import json
-import csv
-import os
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Set
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Dict, List, Set
+
+from . import export
+from .http import easyway_request
 
 class GTFSScraper:
     def __init__(
@@ -93,19 +93,14 @@ class GTFSScraper:
     
     def _make_request(self, endpoint: str, params: Dict = None, data: Dict = None, form_data: Dict = None) -> Dict:
         """Perform an HTTP request to the EasyWay API."""
-        try:
-            if form_data:
-                # Send as form-encoded body
-                response = requests.post(endpoint, headers=self.headers, data=form_data, timeout=30)
-            elif data:
-                response = requests.post(endpoint, headers=self.headers, json=data, timeout=30)
-            else:
-                response = requests.get(endpoint, headers=self.headers, params=params, timeout=30)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            self.logger.error(f"Request failed ({endpoint}): {str(e)}")
-            return None
+        return easyway_request(
+            endpoint,
+            headers=self.headers,
+            logger=self.logger,
+            params=params,
+            data=data,
+            form_data=form_data,
+        )
     
     def scrape_city(self, city: str):
         """Scrape all data for one city."""
@@ -667,73 +662,8 @@ class GTFSScraper:
     
     def save_all_files(self):
         """Write all GTFS tables to CSV files in output_dir."""
-        self.logger.info("Writing GTFS files...")
-        
-        # agency.txt
-        self._save_csv('agency.txt', self.agencies.values(), 
-                      ['agency_id', 'agency_name', 'agency_url', 'agency_timezone', 
-                       'agency_phone', 'agency_lang'])
-        
-        # stops.txt
-        self._save_csv('stops.txt', self.stops.values(),
-                      ['stop_id', 'stop_name', 'stop_lat', 'stop_lon', 
-                       'location_type', 'parent_station'])
-        
-        # routes.txt
-        self._save_csv('routes.txt', self.routes.values(),
-                      ['route_id', 'agency_id', 'route_short_name', 
-                       'route_long_name', 'route_type'])
-        
-        # trips.txt
-        self._save_csv('trips.txt', self.trips.values(),
-                      ['route_id', 'service_id', 'trip_id', 'trip_headsign', 'shape_id'])
-        
-        # stop_times.txt
-        self._save_csv('stop_times.txt', self.stop_times,
-                      ['trip_id', 'arrival_time', 'departure_time', 
-                       'stop_id', 'stop_sequence'])
-        
-        # calendar.txt
-        self._save_csv('calendar.txt', self.calendar.values(),
-                      ['service_id', 'monday', 'tuesday', 'wednesday', 'thursday',
-                       'friday', 'saturday', 'sunday', 'start_date', 'end_date'])
-        
-        # shapes.txt
-        all_shapes = []
-        for shape_points in self.shapes.values():
-            all_shapes.extend(shape_points)
-        self._save_csv('shapes.txt', all_shapes,
-                      ['shape_id', 'shape_pt_lat', 'shape_pt_lon', 'shape_pt_sequence'])
-        
-        # fare_attributes.txt
-        self._save_csv('fare_attributes.txt', self.fare_attributes.values(),
-                      ['fare_id', 'price', 'currency_type', 'payment_method', 
-                       'transfers', 'transfer_duration'])
-        
-        # fare_rules.txt
-        self._save_csv('fare_rules.txt', self.fare_rules,
-                      ['fare_id', 'route_id', 'origin_id', 'destination_id', 'contains_id'])
-        
-        # frequencies.txt
-        self._save_csv('frequencies.txt', self.frequencies,
-                      ['trip_id', 'start_time', 'end_time', 'headway_secs', 'exact_times'])
-        
-        self.logger.info("GTFS files written")
-    
-    def _save_csv(self, filename: str, data: List, fieldnames: List):
-        """Write one GTFS table to output_dir/filename."""
-        if not data:
-            return
-        
-        filepath = self.output_dir / filename
-        
-        with open(filepath, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-            writer.writeheader()
-            writer.writerows(data)
-        
-        self.logger.info(f"{filename} saved ({len(data)} rows)")
-    
+        export.save_all_files(self)
+
     def run(self):
         """Scrape all configured cities and flush outputs."""
         self.logger.info("Starting GTFS scrape...")
@@ -753,11 +683,3 @@ class GTFSScraper:
             # Best-effort save on failure
             self.save_all_files()
             self._save_progress()
-
-
-if __name__ == "__main__":
-    # Example: add more city slugs as needed, e.g. ["istanbul", "ankara", "bursa"]
-    cities = ["istanbul"]
-
-    scraper = GTFSScraper(cities, output_dir="gtfs", logs_dir="logs")
-    scraper.run()
