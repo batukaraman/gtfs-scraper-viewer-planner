@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import csv
 import logging
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, List
+from typing import Any, Dict, Iterable, List
 
 from .transfers_from_stops import write_transfers_file
 
@@ -26,6 +27,89 @@ def _save_csv(
         writer.writeheader()
         writer.writerows(rows)
     logger.info("%s saved (%s rows)", filename, len(rows))
+
+
+def _save_feed_info(out_dir: Path, logger: logging.Logger) -> None:
+    """Create feed_info.txt with metadata."""
+    feed_info = [{
+        'feed_publisher_name': 'EasyWay Istanbul GTFS',
+        'feed_publisher_url': 'https://tr.easyway.info',
+        'feed_lang': 'tr',
+        'feed_start_date': '20251019',
+        'feed_end_date': '20261019',
+        'feed_version': datetime.now().strftime('%Y%m%d'),
+        'feed_contact_email': '',
+        'feed_contact_url': ''
+    }]
+    
+    _save_csv(
+        out_dir,
+        "feed_info.txt",
+        feed_info,
+        [
+            'feed_publisher_name', 'feed_publisher_url', 'feed_lang',
+            'feed_start_date', 'feed_end_date', 'feed_version',
+            'feed_contact_email', 'feed_contact_url'
+        ],
+        logger
+    )
+
+
+def _save_calendar_dates(out_dir: Path, calendar: Dict, logger: logging.Logger) -> None:
+    """Create calendar_dates.txt with Turkish national holidays."""
+    # Turkish national holidays for 2025-2026
+    turkish_holidays = [
+        ("20250101", "Yılbaşı"),
+        ("20250423", "Ulusal Egemenlik ve Çocuk Bayramı"),
+        ("20250501", "Emek ve Dayanışma Günü"),
+        ("20250519", "Atatürk'ü Anma, Gençlik ve Spor Bayramı"),
+        ("20250331", "Ramazan Bayramı 1. Gün"),
+        ("20250401", "Ramazan Bayramı 2. Gün"),
+        ("20250402", "Ramazan Bayramı 3. Gün"),
+        ("20250607", "Kurban Bayramı 1. Gün"),
+        ("20250608", "Kurban Bayramı 2. Gün"),
+        ("20250609", "Kurban Bayramı 3. Gün"),
+        ("20250610", "Kurban Bayramı 4. Gün"),
+        ("20250730", "Demokrasi ve Millî Birlik Günü"),
+        ("20250830", "Zafer Bayramı"),
+        ("20251029", "Cumhuriyet Bayramı"),
+        
+        ("20260101", "Yılbaşı"),
+        ("20260320", "Ramazan Bayramı 1. Gün"),
+        ("20260321", "Ramazan Bayramı 2. Gün"),
+        ("20260322", "Ramazan Bayramı 3. Gün"),
+        ("20260423", "Ulusal Egemenlik ve Çocuk Bayramı"),
+        ("20260501", "Emek ve Dayanışma Günü"),
+        ("20260519", "Atatürk'ü Anma, Gençlik ve Spor Bayramı"),
+        ("20260527", "Kurban Bayramı 1. Gün"),
+        ("20260528", "Kurban Bayramı 2. Gün"),
+        ("20260529", "Kurban Bayramı 3. Gün"),
+        ("20260530", "Kurban Bayramı 4. Gün"),
+        ("20260730", "Demokrasi ve Millî Birlik Günü"),
+        ("20260830", "Zafer Bayramı"),
+        ("20261029", "Cumhuriyet Bayramı"),
+    ]
+    
+    # Get all service IDs
+    service_ids = list(calendar.keys())
+    
+    # Create exception entries for each holiday and service
+    calendar_dates = []
+    for service_id in service_ids:
+        for date, description in turkish_holidays:
+            calendar_dates.append({
+                'service_id': service_id,
+                'date': date,
+                'exception_type': '2'  # 2 = service removed
+            })
+    
+    _save_csv(
+        out_dir,
+        "calendar_dates.txt",
+        calendar_dates,
+        ['service_id', 'date', 'exception_type'],
+        logger
+    )
 
 
 def save_all_files(scraper: Any) -> None:
@@ -52,28 +136,45 @@ def save_all_files(scraper: Any) -> None:
         od,
         "stops.txt",
         scraper.stops.values(),
-        ["stop_id", "stop_name", "stop_lat", "stop_lon", "location_type", "parent_station"],
+        [
+            "stop_id", "stop_code", "stop_name", "stop_desc", "stop_lat", 
+            "stop_lon", "zone_id", "stop_url", "location_type", 
+            "parent_station", "stop_timezone", "wheelchair_boarding", 
+            "platform_code"
+        ],
         logger,
     )
     _save_csv(
         od,
         "routes.txt",
         scraper.routes.values(),
-        ["route_id", "agency_id", "route_short_name", "route_long_name", "route_type"],
+        [
+            "route_id", "agency_id", "route_short_name", "route_long_name", 
+            "route_desc", "route_type", "route_url", "route_color", 
+            "route_text_color", "route_sort_order"
+        ],
         logger,
     )
     _save_csv(
         od,
         "trips.txt",
         scraper.trips.values(),
-        ["route_id", "service_id", "trip_id", "trip_headsign", "shape_id"],
+        [
+            "route_id", "service_id", "trip_id", "trip_headsign", 
+            "trip_short_name", "direction_id", "block_id", "shape_id",
+            "wheelchair_accessible", "bikes_allowed"
+        ],
         logger,
     )
     _save_csv(
         od,
         "stop_times.txt",
         scraper.stop_times,
-        ["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"],
+        [
+            "trip_id", "arrival_time", "departure_time", "stop_id", 
+            "stop_sequence", "stop_headsign", "pickup_type", "drop_off_type",
+            "shape_dist_traveled", "timepoint"
+        ],
         logger,
     )
     _save_csv(
@@ -129,5 +230,12 @@ def save_all_files(scraper: Any) -> None:
     if scraper.stops:
         tp = write_transfers_file(od, stops=list(scraper.stops.values()))
         logger.info("transfers.txt saved (%s)", tp.name)
+    
+    # Create feed_info.txt
+    _save_feed_info(od, logger)
+    
+    # Create calendar_dates.txt with Turkish holidays
+    if scraper.calendar:
+        _save_calendar_dates(od, scraper.calendar, logger)
 
     logger.info("GTFS files written")

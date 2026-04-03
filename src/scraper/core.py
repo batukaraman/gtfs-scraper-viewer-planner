@@ -64,6 +64,18 @@ class GTFSScraper:
             "funicular": 7      # Funicular
         }
         
+        # Transport type to color mapping (route_color, route_text_color)
+        self.transport_colors = {
+            0: ("E31837", "FFFFFF"),  # Tram - Red
+            1: ("0072BC", "FFFFFF"),  # Metro - Blue
+            2: ("6D6E71", "FFFFFF"),  # Rail - Gray
+            3: ("00A94F", "FFFFFF"),  # Bus - Green
+            4: ("00B5E2", "FFFFFF"),  # Ferry - Light Blue
+            5: ("7C4199", "FFFFFF"),  # Cable car - Purple
+            6: ("F7931E", "FFFFFF"),  # Aerial lift - Orange
+            7: ("ED1C24", "FFFFFF"),  # Funicular - Red
+        }
+        
         self.headers = {"X-Requested-With": "XMLHttpRequest"}
         self.base_url = "https://tr.easyway.info/ajax/tr"
         
@@ -180,11 +192,18 @@ class GTFSScraper:
                 
                 self.stops[stop_key] = {
                     'stop_id': stop_key,
+                    'stop_code': '',
                     'stop_name': stop_info[2],
+                    'stop_desc': '',
                     'stop_lat': lat,
                     'stop_lon': lon,
+                    'zone_id': '',
+                    'stop_url': '',
                     'location_type': 0,
-                    'parent_station': ''
+                    'parent_station': '',
+                    'stop_timezone': 'Europe/Istanbul',
+                    'wheelchair_boarding': '0',
+                    'platform_code': ''
                 }
         
         self.logger.info(f"{len(stops_data)} stops added")
@@ -217,12 +236,20 @@ class GTFSScraper:
             
             agency_id = f"{city}_{route_info.get('sp', '1')}"
             
+            # Get default colors for this transport type
+            colors = self.transport_colors.get(transport_type, ("FFFFFF", "000000"))
+            
             self.routes[route_key] = {
                 'route_id': route_key,
                 'agency_id': agency_id,
                 'route_short_name': route_info['rn'],
                 'route_long_name': route_info['rd'],
-                'route_type': transport_type
+                'route_desc': route_info['rd'],  # Use long name as description
+                'route_type': transport_type,
+                'route_url': f"https://tr.easyway.info/tr/{city}/route/{route_id}",
+                'route_color': colors[0],
+                'route_text_color': colors[1],
+                'route_sort_order': ''
             }
             
             # Fare from list payload
@@ -473,6 +500,9 @@ class GTFSScraper:
                 # shape_id from direction
                 shape_id = self._get_shape_id(route_key, direction_key)
                 
+                # direction_id: 0 = forward, 1 = backward
+                direction_id = '1' if direction_key == 'backward' else '0'
+                
                 # Trip row
                 if trip_id not in self.trips:
                     self.trips[trip_id] = {
@@ -480,7 +510,12 @@ class GTFSScraper:
                         'service_id': service_id,
                         'trip_id': trip_id,
                         'trip_headsign': headsign,
-                        'shape_id': shape_id
+                        'trip_short_name': '',
+                        'direction_id': direction_id,
+                        'block_id': '',
+                        'shape_id': shape_id,
+                        'wheelchair_accessible': '0',
+                        'bikes_allowed': '0'
                     }
                 
                 # stop_times for this trip
@@ -535,6 +570,9 @@ class GTFSScraper:
             return
         
         shape_id = self._get_shape_id(route_key, direction_key)
+        
+        # direction_id: 0 = forward, 1 = backward
+        direction_id = '1' if direction_key == 'backward' else '0'
 
         # Walk window at headway
         current_mins = start_total_mins
@@ -551,7 +589,12 @@ class GTFSScraper:
                     'service_id': service_id,
                     'trip_id': trip_id,
                     'trip_headsign': headsign,
-                    'shape_id': shape_id
+                    'trip_short_name': '',
+                    'direction_id': direction_id,
+                    'block_id': '',
+                    'shape_id': shape_id,
+                    'wheelchair_accessible': '0',
+                    'bikes_allowed': '0'
                 }
             
             # HH:MM:SS departure at first stop
@@ -624,7 +667,12 @@ class GTFSScraper:
                 'arrival_time': time_str,
                 'departure_time': time_str,
                 'stop_id': stop_id,
-                'stop_sequence': idx
+                'stop_sequence': idx,
+                'stop_headsign': '',
+                'pickup_type': '0',  # 0 = regularly scheduled pickup
+                'drop_off_type': '0',  # 0 = regularly scheduled drop off
+                'shape_dist_traveled': '',
+                'timepoint': '1'  # 1 = times are exact
             })
     
     def _add_fare_info(self, route_key: str, price: float, currency: str):
