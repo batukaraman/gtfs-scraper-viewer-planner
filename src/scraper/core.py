@@ -1,7 +1,7 @@
 import json
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Set
 
@@ -82,6 +82,9 @@ class GTFSScraper:
         # Auto-save counter
         self.save_interval = 10  # persist every N operations
         self.operation_count = 0
+
+        # Fixed once per process for feed_info.feed_version (pipeline-friendly build id)
+        self.feed_build_utc = datetime.now(timezone.utc)
         
     def _load_progress(self) -> Dict:
         """Load persisted progress state."""
@@ -676,7 +679,12 @@ class GTFSScraper:
             })
     
     def _add_fare_info(self, route_key: str, price: float, currency: str):
-        """Add fare_attributes and fare_rules rows (deduped by price+currency)."""
+        """Add fare_attributes and fare_rules rows (deduped by price+currency).
+
+        Prices come from EasyWay list/detail payloads only. They are indicative
+        single-line amounts, not official IETT/İBB/İstanbulkart products; see
+        feed_info.feed_license in the exported feed.
+        """
 
         # One fare_id per price+currency
         fare_key = f"{price}_{currency}"
@@ -714,6 +722,7 @@ class GTFSScraper:
 
     def run(self):
         """Scrape all configured cities and flush outputs."""
+        self.feed_build_utc = datetime.now(timezone.utc)
         self.logger.info("Starting GTFS scrape...")
         self.logger.info(f"Cities: {', '.join(self.cities)}")
         

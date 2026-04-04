@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -29,29 +29,80 @@ def _save_csv(
     logger.info("%s saved (%s rows)", filename, len(rows))
 
 
-def _save_feed_info(out_dir: Path, logger: logging.Logger) -> None:
-    """Create feed_info.txt with metadata."""
+def _calendar_service_window(calendar: Dict) -> tuple[str, str]:
+    """Min start_date and max end_date from calendar rows (YYYYMMDD)."""
+    if not calendar:
+        return "20251019", "20261019"
+    starts = []
+    ends = []
+    for row in calendar.values():
+        s = row.get("start_date", "")
+        e = row.get("end_date", "")
+        if s and len(s) == 8 and s.isdigit():
+            starts.append(s)
+        if e and len(e) == 8 and e.isdigit():
+            ends.append(e)
+    if not starts or not ends:
+        return "20251019", "20261019"
+    return min(starts), max(ends)
+
+
+def _build_feed_version(feed_id: str, data_start: str, data_end: str, build_utc: datetime) -> str:
+    """Stable, auditable version: data window + immutable UTC build timestamp."""
+    stamp = build_utc.astimezone(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+    return f"{feed_id}|data_{data_start}_{data_end}|build_{stamp}"
+
+
+# Shown in feed_info.feed_license; consumers must not treat fare tables as official tariffs.
+_FARE_AND_DATA_LICENSE = (
+    "TR: Ücretler yalnızca tr.easyway.info üzerinden görünen tahmini liste "
+    "fiyatlarıdır; resmi İETT/İBB/İstanbulkart tarifesi değildir. Aktarma "
+    "indirimleri, abonelikler ve özel tarifeler modellenmemiştir. Faturalama "
+    "veya hukuki ücret tespiti için kullanılamaz. "
+    "EN: Fares are approximate list prices from tr.easyway.info, not official "
+    "İETT/İBB/İstanbulkart products. Transfer discounts, subscriptions, and "
+    "special tariffs are not modeled. Do not use for billing or legal fare "
+    "determination."
+)
+
+
+def _save_feed_info(out_dir: Path, logger: logging.Logger, scraper: Any) -> None:
+    """Create feed_info.txt with metadata tied to calendar window and build time."""
+    data_start, data_end = _calendar_service_window(scraper.calendar)
+    build_utc = getattr(scraper, "feed_build_utc", None) or datetime.now(timezone.utc)
+    feed_id = "easyway-istanbul-gtfs"
+    feed_version = _build_feed_version(feed_id, data_start, data_end, build_utc)
+
     feed_info = [{
-        'feed_publisher_name': 'EasyWay Istanbul GTFS',
-        'feed_publisher_url': 'https://tr.easyway.info',
-        'feed_lang': 'tr',
-        'feed_start_date': '20251019',
-        'feed_end_date': '20261019',
-        'feed_version': datetime.now().strftime('%Y%m%d'),
-        'feed_contact_email': '',
-        'feed_contact_url': ''
+        "feed_publisher_name": "EasyWay Istanbul GTFS",
+        "feed_publisher_url": "https://tr.easyway.info",
+        "feed_lang": "tr",
+        "feed_start_date": data_start,
+        "feed_end_date": data_end,
+        "feed_version": feed_version,
+        "feed_contact_email": "",
+        "feed_contact_url": "",
+        "feed_id": feed_id,
+        "feed_license": _FARE_AND_DATA_LICENSE,
     }]
-    
+
     _save_csv(
         out_dir,
         "feed_info.txt",
         feed_info,
         [
-            'feed_publisher_name', 'feed_publisher_url', 'feed_lang',
-            'feed_start_date', 'feed_end_date', 'feed_version',
-            'feed_contact_email', 'feed_contact_url'
+            "feed_publisher_name",
+            "feed_publisher_url",
+            "feed_lang",
+            "feed_start_date",
+            "feed_end_date",
+            "feed_version",
+            "feed_contact_email",
+            "feed_contact_url",
+            "feed_id",
+            "feed_license",
         ],
-        logger
+        logger,
     )
 
 
@@ -232,7 +283,7 @@ def save_all_files(scraper: Any) -> None:
         logger.info("transfers.txt saved (%s)", tp.name)
     
     # Create feed_info.txt
-    _save_feed_info(od, logger)
+    _save_feed_info(od, logger, scraper)
     
     # Create calendar_dates.txt with Turkish holidays
     if scraper.calendar:
