@@ -23,6 +23,16 @@ def use_database() -> bool:
     return database_url() is not None
 
 
+def otp_base_url() -> str | None:
+    """Base URL for OpenTripPlanner (e.g. ``http://localhost:8080``). No trailing slash."""
+    u = (os.getenv("OTP_BASE_URL") or "").strip().rstrip("/")
+    return u if u else None
+
+
+def otp_planner_available() -> bool:
+    return otp_base_url() is not None
+
+
 def database_url_fingerprint() -> str:
     """Short stable hash for Streamlit cache keys (does not log the secret)."""
     url = database_url()

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Set
 
 from . import export
+from .gtfs_integrity import ensure_stop_from_schedule_payload
 from .http import easyway_request
 
 class GTFSScraper:
@@ -653,14 +654,20 @@ class GTFSScraper:
         
         # Assume 2 minutes between successive stops
         time_increment = 2
-        
-        for idx, stop in enumerate(stops_list, 1):
+
+        seq = 0
+        for stop in stops_list:
             # Stop id from API ('id' or 'i')
             stop_id_val = stop.get('id') if 'id' in stop else stop.get('i')
+            if stop_id_val is None or stop_id_val == '':
+                self.logger.warning("Skipping stop_time row: missing stop id in schedule payload")
+                continue
+            seq += 1
             stop_id = f"{city}_{stop_id_val}"
-            
+            ensure_stop_from_schedule_payload(self.stops, city, stop_id, stop)
+
             # Cumulative time from start
-            minutes = current_minutes + (idx - 1) * time_increment
+            minutes = current_minutes + (seq - 1) * time_increment
             hours = minutes // 60
             mins = minutes % 60
             time_str = f"{hours:02d}:{mins:02d}:00"
@@ -670,7 +677,7 @@ class GTFSScraper:
                 'arrival_time': time_str,
                 'departure_time': time_str,
                 'stop_id': stop_id,
-                'stop_sequence': idx,
+                'stop_sequence': seq,
                 'stop_headsign': '',
                 'pickup_type': '0',  # 0 = regularly scheduled pickup
                 'drop_off_type': '0',  # 0 = regularly scheduled drop off

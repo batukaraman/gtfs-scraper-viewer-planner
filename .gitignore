@@ -46,6 +46,12 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
+
+# OpenTripPlanner graph inputs (keep otp/data/README.txt)
+otp/data/*.pbf
+otp/data/*.zip
+otp/data/graph.obj
+otp/data/*.obj
 nosetests.xml
 coverage.xml
 *.cover

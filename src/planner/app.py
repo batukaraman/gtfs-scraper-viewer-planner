@@ -23,7 +23,12 @@ from streamlit_folium import st_folium
 
 load_dotenv()
 
-from gtfs_source import database_url_fingerprint, use_database
+from gtfs_source import (
+    database_url_fingerprint,
+    otp_base_url,
+    otp_planner_available,
+    use_database,
+)
 
 from planner.journey import (
     MultiLegPlan,
@@ -37,6 +42,12 @@ from planner.raptor import Journey
 from planner.snapshot import raptor_cache_path, save_raptor_snapshot, try_load_raptor_snapshot
 from planner.timeutil import seconds_to_gtfs_time
 from planner.timing import log_phase, timed_phase, timing_enabled
+from planner.otp_client import (
+    OtpItineraryView,
+    fetch_plan,
+    format_itinerary_summary,
+    graphql_url,
+)
 
 
 def _duration_label(sec: int) -> str:
@@ -194,6 +205,144 @@ def _decimate_shape_points(
         return pts
     step = max(1, len(pts) // max_points)
     return pts[::step]
+
+
+def _otp_folium_map(iv: OtpItineraryView, waypoints: List[Tuple[float, float]]) -> folium.Map:
+    lats = [w[0] for w in waypoints]
+    lons = [w[1] for w in waypoints]
+    mid_lat = sum(lats) / len(lats)
+    mid_lon = sum(lons) / len(lons)
+    m = folium.Map(location=[mid_lat, mid_lon], zoom_start=12, tiles="OpenStreetMap")
+    for i, (la, lo) in enumerate(waypoints):
+        color = "green" if i == 0 else "red"
+        folium.Marker(
+            [la, lo],
+            tooltip=f"W{i + 1}",
+            icon=folium.Icon(color=color, icon="map-marker", prefix="fa"),
+        ).add_to(m)
+    for leg in iv.legs:
+        if len(leg.line) < 2:
+            continue
+        folium.PolyLine(
+            [(a, b) for a, b in _decimate_shape_points(leg.line)],
+            weight=4,
+            opacity=0.75,
+            tooltip=leg.mode,
+        ).add_to(m)
+    return m
+
+
+def _render_otp_results(
+    views: List[OtpItineraryView],
+    waypoints: List[Tuple[float, float]],
+    err: Optional[str],
+) -> None:
+    if err:
+        st.warning(f"OpenTripPlanner uyarı/hata: {err}")
+    if not views:
+        st.error("OTP sonuç döndürmedi (grafik yok, tarih dışı veya ulaşılamayan hedef olabilir).")
+        return
+    pick = 0
+    if len(views) > 1:
+        pick = st.selectbox(
+            "Güzergâh seçenekleri",
+            options=list(range(len(views))),
+            format_func=lambda i: format_itinerary_summary(views[i], i),
+            key="otp_itin_pick",
+        )
+    iv = views[pick]
+    st.success(format_itinerary_summary(iv, pick))
+    for li, leg in enumerate(iv.legs, 1):
+        rt = f" **{leg.route_name}**" if leg.route_name and leg.mode == "TRANSIT" else ""
+        st.markdown(
+            f"{li}. **{leg.mode}**{rt} · {leg.start_label} → {leg.end_label}"
+        )
+    if st.checkbox("Haritayı göster (OTP)", value=False, key="show_otp_map"):
+        fm = _otp_folium_map(iv, waypoints)
+        st_folium(fm, width=None, height=520, returned_objects=[])
+
+
+@st.fragment
+def _otp_plan_fragment(
+    *,
+    service_date: dt.date,
+    use_now: bool,
+    dep_time: dt.time,
+    max_alt: int,
+    n_wp: int,
+) -> None:
+    base = otp_base_url()
+    if not base:
+        st.error("OTP_BASE_URL tanımlı değil.")
+        return
+
+    st.markdown("### Waypoints (lat, lon)")
+    cols = st.columns(min(n_wp, 4))
+    waypoints: List[Tuple[float, float]] = []
+    for i in range(n_wp):
+        c = cols[i % len(cols)]
+        with c:
+            st.markdown(f"**W{i + 1}**")
+            la = st.number_input(f"Lat {i + 1}", value=41.0082, format="%.6f", key=f"otpla{i}")
+            lo = st.number_input(f"Lon {i + 1}", value=28.9784, format="%.6f", key=f"otplo{i}")
+        waypoints.append((float(la), float(lo)))
+
+    if n_wp != 2:
+        st.info("OpenTripPlanner bu arayüzde yalnızca **2 durak (A→B)** destekler. Çoklu durak için **Dahili Python** seçin.")
+
+    if use_now:
+        depart = dt.datetime.now()
+    else:
+        depart = dt.datetime.combine(service_date, dep_time)
+
+    pkg = st.session_state.get("_otp_package")
+    if pkg is not None and tuple(pkg.get("waypoints", ())) != tuple(waypoints):
+        st.session_state.pop("_otp_package", None)
+        pkg = None
+
+    if st.button("Plan", type="primary", key="otp_plan_btn"):
+        if n_wp != 2:
+            st.error("İki waypoint kullanın veya rota motorunu değiştirin.")
+        else:
+            if "show_otp_map" in st.session_state:
+                st.session_state["show_otp_map"] = False
+            wp_r = tuple((round(la, 5), round(lo, 5)) for la, lo in waypoints)
+            ds = depart.hour * 3600 + depart.minute * 60 + depart.second
+            dep_q = (ds // 60) * 60
+            sig = ("otp", base, service_date.isoformat(), wp_r, dep_q, int(max_alt), use_now)
+            ttl: Dict[tuple, Tuple[float, Any]] = st.session_state.setdefault("_otp_ttl_cache", {})
+            now = time.time()
+            for ck, (ts, _) in list(ttl.items()):
+                if now - ts > _PLAN_TTL_SEC:
+                    del ttl[ck]
+            if sig in ttl and now - ttl[sig][0] <= _PLAN_TTL_SEC:
+                cached = ttl[sig][1]
+                views, err = cached["views"], cached["err"]
+            else:
+                with timed_phase("otp fetch_plan"):
+                    _data, views, err = fetch_plan(
+                        base,
+                        from_lat=waypoints[0][0],
+                        from_lon=waypoints[0][1],
+                        to_lat=waypoints[1][0],
+                        to_lon=waypoints[1][1],
+                        depart=depart,
+                        num_itineraries=max_alt,
+                    )
+                ttl[sig] = (now, {"views": views, "err": err})
+            st.session_state["_otp_package"] = {
+                "waypoints": list(waypoints),
+                "views": views,
+                "err": err,
+            }
+            pkg = st.session_state["_otp_package"]
+
+    if pkg is not None:
+        _render_otp_results(
+            pkg["views"],
+            pkg["waypoints"],
+            pkg.get("err"),
+        )
 
 
 def _journey_map(
@@ -467,6 +616,14 @@ def main() -> None:
         snap_m = st.slider("Snap radius (m)", 200, 800, 450)
         max_alt = st.slider("Alternatives per leg", 1, 5, 3)
         n_wp = st.number_input("Waypoints (ordered)", min_value=2, max_value=8, value=2)
+        if otp_planner_available():
+            st.divider()
+            st.radio(
+                "Rota motoru",
+                ["OpenTripPlanner", "Dahili Python (GTFS)"],
+                key="planner_engine",
+                help="OpenTripPlanner için önce Docker ile grafik derleyip sunucuyu başlatın (docs/otp.md).",
+            )
 
     if use_database():
         feed_cache_key = f"pg:{database_url_fingerprint()}"
@@ -496,10 +653,30 @@ def main() -> None:
         use_now,
         t.hour,
         t.minute,
+        str(st.session_state.get("planner_engine", "")),
     )
     if st.session_state.get("_planner_options_key") != options_key:
         st.session_state["_planner_options_key"] = options_key
         st.session_state.pop("_plan_package", None)
+        st.session_state.pop("_otp_package", None)
+
+    use_otp = otp_planner_available() and str(
+        st.session_state.get("planner_engine", "")
+    ).startswith("OpenTripPlanner")
+
+    if use_otp:
+        st.info(
+            "**OpenTripPlanner** — Python ağı yüklenmedi. "
+            f"GraphQL: `{graphql_url(otp_base_url() or '')}`"
+        )
+        _otp_plan_fragment(
+            service_date=d,
+            use_now=use_now,
+            dep_time=t,
+            max_alt=int(max_alt),
+            n_wp=int(n_wp),
+        )
+        return
 
     try:
         if use_database():

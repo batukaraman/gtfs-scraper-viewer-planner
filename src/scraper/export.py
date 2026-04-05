@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+from .gtfs_integrity import ensure_agencies_cover_routes, ensure_stops_cover_stop_times
 from .transfers_from_stops import write_transfers_file
 
 
@@ -169,6 +170,9 @@ def save_all_files(scraper: Any) -> None:
     logger = scraper.logger
     od = scraper.output_dir
     logger.info("Writing GTFS files...")
+
+    ensure_agencies_cover_routes(scraper.agencies, scraper.routes)
+    ensure_stops_cover_stop_times(scraper.stops, scraper.stop_times)
 
     _save_csv(
         od,

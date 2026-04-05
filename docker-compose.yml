@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   gtfs-postgres:
     image: postgis/postgis:16-3.4
@@ -84,6 +82,22 @@ services:
     depends_on:
       gtfs-postgres:
         condition: service_healthy
+
+  # OpenTripPlanner 2.x — build graph first (see docs/otp.md), then: docker compose --profile otp up -d otp
+  otp:
+    profiles: ["otp"]
+    image: opentripplanner/opentripplanner:2.5.0
+    container_name: gtfs_otp
+    restart: unless-stopped
+    ports:
+      - "${OTP_PORT:-8081}:8080"
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx8g"
+    volumes:
+      - ./otp/data:/var/opentripplanner
+    command: ["--load", "--serve"]
+    networks:
+      - gtfs-network
 
 volumes:
   gtfs_postgres_data:
