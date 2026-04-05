@@ -6,6 +6,17 @@ import folium
 import pandas as pd
 import streamlit as st
 
+from gtfs_source import database_url
+
+_STOP_TIME_COLS = (
+    "trip_id",
+    "arrival_time",
+    "departure_time",
+    "stop_id",
+    "stop_sequence",
+)
+_SHAPE_COLS = ("shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence")
+
 
 class GTFSVisualizer:
     def __init__(self, gtfs_dir: str):
@@ -13,27 +24,119 @@ class GTFSVisualizer:
         self.load_data()
 
     def load_data(self):
-        """Load GTFS CSV files from gtfs_dir."""
+        """Load GTFS CSV files from gtfs_dir (minimal columns on huge tables)."""
         try:
-            self.agencies = pd.read_csv(self.gtfs_dir / "agency.txt")
-            self.stops = pd.read_csv(self.gtfs_dir / "stops.txt")
-            self.routes = pd.read_csv(self.gtfs_dir / "routes.txt")
-            self.trips = pd.read_csv(self.gtfs_dir / "trips.txt")
-            self.stop_times = pd.read_csv(self.gtfs_dir / "stop_times.txt")
-            self.calendar = pd.read_csv(self.gtfs_dir / "calendar.txt")
-            self.shapes = pd.read_csv(self.gtfs_dir / "shapes.txt")
+            d = self.gtfs_dir
+            self.agencies = pd.read_csv(d / "agency.txt")
+            self.stops = pd.read_csv(d / "stops.txt", dtype={"stop_id": str})
+            self.routes = pd.read_csv(d / "routes.txt")
+            self.trips = pd.read_csv(d / "trips.txt", dtype={"trip_id": str, "route_id": str})
+            st_path = d / "stop_times.txt"
+            try:
+                self.stop_times = pd.read_csv(
+                    st_path,
+                    dtype={"trip_id": str, "stop_id": str},
+                    usecols=list(_STOP_TIME_COLS),
+                    low_memory=False,
+                )
+            except ValueError:
+                self.stop_times = pd.read_csv(
+                    st_path,
+                    dtype={"trip_id": str, "stop_id": str},
+                    low_memory=False,
+                )
+            self.calendar = pd.read_csv(d / "calendar.txt")
+            shapes_path = d / "shapes.txt"
+            if shapes_path.is_file():
+                try:
+                    self.shapes = pd.read_csv(
+                        shapes_path,
+                        dtype={"shape_id": str},
+                        usecols=list(_SHAPE_COLS),
+                        low_memory=False,
+                    )
+                except ValueError:
+                    self.shapes = pd.read_csv(shapes_path, dtype={"shape_id": str}, low_memory=False)
+            else:
+                self.shapes = pd.DataFrame(columns=list(_SHAPE_COLS))
 
-            freq_file = self.gtfs_dir / "frequencies.txt"
+            freq_file = d / "frequencies.txt"
             if freq_file.exists():
                 self.frequencies = pd.read_csv(freq_file)
             else:
                 self.frequencies = pd.DataFrame()
 
-            st.success("GTFS data loaded successfully.")
+            st.success("GTFS data loaded successfully (CSV).")
         except Exception as e:
             st.error(f"Error loading GTFS data: {str(e)}")
             raise
 
+
+class DatabaseGTFSVisualizer:
+    """GTFS Visualizer using PostgreSQL database."""
+    
+    def __init__(self, database_url: str):
+        """Initialize visualizer with PostgreSQL connection.
+        
+        Args:
+            database_url: PostgreSQL connection string
+        """
+        try:
+            from sqlalchemy import create_engine
+        except ImportError:
+            raise ImportError(
+                "SQLAlchemy required for database support. "
+                "Install with: pip install -e '.[db]'"
+            )
+        
+        self.database_url = database_url
+        self.engine = create_engine(database_url, echo=False)
+        self.load_data()
+    
+    def load_data(self):
+        """Load GTFS data from PostgreSQL."""
+        try:
+            self.agencies = pd.read_sql("SELECT * FROM agency", self.engine)
+            self.stops = pd.read_sql("SELECT * FROM stops", self.engine)
+            self.routes = pd.read_sql("SELECT * FROM routes", self.engine)
+            self.trips = pd.read_sql("SELECT * FROM trips", self.engine)
+            self.calendar = pd.read_sql("SELECT * FROM calendar", self.engine)
+            
+            # Load stop_times with converted times
+            stop_times_query = """
+                SELECT 
+                    trip_id,
+                    stop_id,
+                    stop_sequence,
+                    seconds_to_gtfs_time(arrival_time) as arrival_time,
+                    seconds_to_gtfs_time(departure_time) as departure_time,
+                    stop_headsign,
+                    pickup_type,
+                    drop_off_type
+                FROM stop_times
+                ORDER BY trip_id, stop_sequence
+            """
+            self.stop_times = pd.read_sql(stop_times_query, self.engine)
+            
+            # Load shapes
+            self.shapes = pd.read_sql(
+                "SELECT shape_id, shape_pt_lat, shape_pt_lon, shape_pt_sequence FROM shapes",
+                self.engine
+            )
+            
+            # Optional: frequencies
+            try:
+                self.frequencies = pd.read_sql("SELECT * FROM frequencies", self.engine)
+            except Exception:
+                self.frequencies = pd.DataFrame()
+            
+            st.success("✓ GTFS data loaded from PostgreSQL database")
+            
+        except Exception as e:
+            st.error(f"Error loading from database: {str(e)}")
+            raise
+    
+    # Reuse all the visualization methods from GTFSVisualizer
     def get_route_directions(self, route_id: str):
         """Return direction_key -> trip_headsign for a route."""
         route_trips = self.trips[self.trips["route_id"] == route_id]
@@ -78,160 +181,61 @@ class GTFSVisualizer:
             "stop_sequence"
         )
 
-        trip_stops = trip_stops.merge(
-            self.stops[["stop_id", "stop_name", "stop_lat", "stop_lon"]],
-            on="stop_id",
-            how="left",
-        )
+        merged = trip_stops.merge(self.stops, on="stop_id", how="left")
+        return merged
 
-        return trip_stops
-
-    def get_direction_schedule(self, route_id: str, direction: str):
-        """Collect departure times by service day bucket for a direction."""
+    def get_route_shape(self, route_id: str, direction: str):
+        """Route shape coordinates for a direction."""
         route_trips = self.trips[self.trips["route_id"] == route_id]
-        direction_trips = route_trips[route_trips["trip_id"].str.contains(direction)]
 
-        if direction_trips.empty:
-            return {"weekday": [], "saturday": [], "sunday": []}
+        for _, trip in route_trips.iterrows():
+            if direction in trip["trip_id"] and pd.notna(trip.get("shape_id")):
+                shape_id = trip["shape_id"]
+                shape_points = self.shapes[self.shapes["shape_id"] == shape_id].sort_values("shape_pt_sequence")
 
-        schedule = {"weekday": [], "saturday": [], "sunday": []}
+                if not shape_points.empty:
+                    return shape_points[["shape_pt_lat", "shape_pt_lon"]].values.tolist()
 
-        for _, trip in direction_trips.iterrows():
-            trip_id = trip["trip_id"]
-            service_id = trip["service_id"]
+        return []
 
-            if not self.frequencies.empty:
-                freq = self.frequencies[self.frequencies["trip_id"] == trip_id]
-                if not freq.empty:
-                    freq_row = freq.iloc[0]
-                    service_info = self.calendar[self.calendar["service_id"] == service_id]
+    def get_route_schedule(self, route_id: str, direction: str):
+        """Departure times from first stop for a direction."""
+        route_trips = self.trips[self.trips["route_id"] == route_id]
 
-                    if not service_info.empty:
-                        service_row = service_info.iloc[0]
-                        freq_str = (
-                            f"{freq_row['start_time']} - {freq_row['end_time']} "
-                            f"(every {freq_row['headway_secs'] // 60} min)"
-                        )
+        direction_trips = []
+        for _, trip in route_trips.iterrows():
+            if direction in trip["trip_id"]:
+                direction_trips.append(trip["trip_id"])
 
-                        if service_row["monday"] == 1:
-                            schedule["weekday"].append(freq_str)
-                        if service_row["saturday"] == 1:
-                            schedule["saturday"].append(freq_str)
-                        if service_row["sunday"] == 1:
-                            schedule["sunday"].append(freq_str)
-                    continue
+        if not direction_trips:
+            return pd.DataFrame()
 
-            trip_times = self.stop_times[self.stop_times["trip_id"] == trip_id]
-            if trip_times.empty:
-                continue
+        trip_stop_times = self.stop_times[self.stop_times["trip_id"].isin(direction_trips)]
 
-            first_stop = trip_times.sort_values("stop_sequence").iloc[0]
-            departure_time = first_stop["departure_time"]
+        first_stops = trip_stop_times.loc[trip_stop_times.groupby("trip_id")["stop_sequence"].idxmin()]
 
-            service_info = self.calendar[self.calendar["service_id"] == service_id]
-
-            if service_info.empty:
-                continue
-
-            service_row = service_info.iloc[0]
-
-            if service_row["monday"] == 1:
-                schedule["weekday"].append(departure_time)
-
-            if service_row["saturday"] == 1:
-                schedule["saturday"].append(departure_time)
-
-            if service_row["sunday"] == 1:
-                schedule["sunday"].append(departure_time)
-
-        for key in schedule:
-            schedule[key] = sorted(list(set(schedule[key])))
+        schedule = first_stops[["trip_id", "departure_time"]].copy()
+        schedule = schedule.sort_values("departure_time")
 
         return schedule
 
-    def get_route_shape(self, route_id: str, direction: str):
-        """Shape points for a direction."""
-        route_trips = self.trips[self.trips["route_id"] == route_id]
-        direction_trip = route_trips[route_trips["trip_id"].str.contains(direction)]
 
-        if direction_trip.empty:
-            return pd.DataFrame()
+def create_visualizer(database_url_override: str | None = None, gtfs_dir: str = "gtfs"):
+    """PostgreSQL **or** CSV — mutually exclusive (same rule as ``gtfs_source``).
 
-        shape_id = direction_trip.iloc[0]["shape_id"]
+    If ``DATABASE_URL`` is set (or ``database_url_override``), returns
+    :class:`~viewer.optimized_visualizer.OptimizedDatabaseVisualizer`.
+    Otherwise loads :class:`GTFSVisualizer` from ``gtfs_dir`` only.
+    """
+    url = (database_url_override or database_url() or "").strip()
+    if url:
+        try:
+            from viewer.optimized_visualizer import OptimizedDatabaseVisualizer
 
-        shape_points = self.shapes[self.shapes["shape_id"] == shape_id].sort_values("shape_pt_sequence")
-
-        return shape_points
-
-    def create_route_map(self, route_id: str, direction: str):
-        """Folium map with polyline and stop markers."""
-        stops_df = self.get_direction_stops(route_id, direction)
-
-        if stops_df.empty:
-            return None
-
-        center_lat = stops_df["stop_lat"].mean()
-        center_lon = stops_df["stop_lon"].mean()
-
-        m = folium.Map(location=[center_lat, center_lon], zoom_start=12, tiles="OpenStreetMap")
-
-        shape_points = self.get_route_shape(route_id, direction)
-        if not shape_points.empty:
-            coordinates = list(zip(shape_points["shape_pt_lat"], shape_points["shape_pt_lon"]))
-            folium.PolyLine(
-                coordinates,
-                color="blue",
-                weight=4,
-                opacity=0.7,
-                tooltip="Route shape",
-            ).add_to(m)
-
-        for idx, stop in stops_df.iterrows():
-            if idx == stops_df.index[0]:
-                folium.Marker(
-                    location=[stop["stop_lat"], stop["stop_lon"]],
-                    popup=(f"<b>Start:</b><br>{stop['stop_name']}<br>{stop['departure_time']}"),
-                    tooltip=stop["stop_name"],
-                    icon=folium.Icon(color="green", icon="play", prefix="fa"),
-                ).add_to(m)
-            elif idx == stops_df.index[-1]:
-                folium.Marker(
-                    location=[stop["stop_lat"], stop["stop_lon"]],
-                    popup=f"<b>End:</b><br>{stop['stop_name']}<br>{stop['arrival_time']}",
-                    tooltip=stop["stop_name"],
-                    icon=folium.Icon(color="red", icon="stop", prefix="fa"),
-                ).add_to(m)
-            else:
-                folium.CircleMarker(
-                    location=[stop["stop_lat"], stop["stop_lon"]],
-                    radius=6,
-                    popup=(
-                        f"<b>{stop['stop_name']}</b><br>Seq: {stop['stop_sequence']}<br>"
-                        f"{stop['arrival_time']}"
-                    ),
-                    tooltip=stop["stop_name"],
-                    color="blue",
-                    fill=True,
-                    fillColor="lightblue",
-                    fillOpacity=0.8,
-                ).add_to(m)
-
-        return m
-
-    def format_schedule_table(self, schedule: dict):
-        """Wide dataframe: weekday / Saturday / Sunday columns."""
-        max_len = max(len(schedule["weekday"]), len(schedule["saturday"]), len(schedule["sunday"]))
-
-        weekday = schedule["weekday"] + [""] * (max_len - len(schedule["weekday"]))
-        saturday = schedule["saturday"] + [""] * (max_len - len(schedule["saturday"]))
-        sunday = schedule["sunday"] + [""] * (max_len - len(schedule["sunday"]))
-
-        df = pd.DataFrame(
-            {
-                "Weekday (Mon–Fri)": weekday,
-                "Saturday": saturday,
-                "Sunday": sunday,
-            }
-        )
-
-        return df
+            return OptimizedDatabaseVisualizer(url)
+        except ImportError as e:
+            raise ImportError(
+                "Database extras required: pip install -e '.[db]' "
+                "(sqlalchemy, psycopg2-binary, etc.)"
+            ) from e
+    return GTFSVisualizer(gtfs_dir)

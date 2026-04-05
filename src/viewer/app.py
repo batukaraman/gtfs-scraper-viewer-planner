@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import streamlit as st
+from dotenv import load_dotenv
 from streamlit_folium import st_folium
 
+load_dotenv()
+
+from gtfs_source import database_url_fingerprint, use_database
+
 try:
-    from viewer.visualizer import GTFSVisualizer
+    from viewer.visualizer import create_visualizer
 except ImportError:
     # streamlit run .../viewer/app.py executes this file as __main__ (no package context)
-    from visualizer import GTFSVisualizer
+    from visualizer import create_visualizer
 
 
 def main() -> None:
@@ -22,9 +29,32 @@ def main() -> None:
     st.title("🚍 GTFS viewer")
     st.markdown("---")
 
+    with st.sidebar:
+        st.markdown("## Data source")
+        if use_database():
+            st.caption("Using **PostgreSQL** (`DATABASE_URL`). Local GTFS folder is not used.")
+            gtfs_input = "gtfs"
+        else:
+            st.caption("CSV mode: unset `DATABASE_URL` to load from disk.")
+            gtfs_input = st.text_input("GTFS directory", value="gtfs", key="viewer_gtfs_dir")
+
     try:
-        if "visualizer" not in st.session_state:
-            st.session_state.visualizer = GTFSVisualizer("gtfs")
+        p = Path(gtfs_input).expanduser()
+        try:
+            p = p.resolve()
+        except OSError:
+            p = Path(gtfs_input).expanduser()
+        viz_key: tuple = (
+            ("db", database_url_fingerprint()) if use_database() else ("csv", str(p))
+        )
+        if (
+            "visualizer" not in st.session_state
+            or st.session_state.get("_viewer_viz_key") != viz_key
+        ):
+            st.session_state["_viewer_viz_key"] = viz_key
+            st.session_state.visualizer = create_visualizer(
+                gtfs_dir=str(p) if not use_database() else "gtfs"
+            )
         viz = st.session_state.visualizer
 
         st.sidebar.markdown("## Route")

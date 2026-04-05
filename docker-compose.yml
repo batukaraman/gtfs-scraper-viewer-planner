@@ -1,0 +1,96 @@
+version: "3.8"
+
+services:
+  gtfs-postgres:
+    image: postgis/postgis:16-3.4
+    container_name: gtfs_db
+    restart: unless-stopped
+
+    environment:
+      # Database credentials - change these in production!
+      POSTGRES_DB: ${POSTGRES_DB:-gtfs_transit}
+      POSTGRES_USER: ${POSTGRES_USER:-gtfs_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_secure_password}
+
+      # Performance tuning for import operations
+      POSTGRES_SHARED_BUFFERS: 512MB
+      POSTGRES_WORK_MEM: 64MB
+      POSTGRES_MAINTENANCE_WORK_MEM: 256MB
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 2GB
+
+      # UTF-8 for global charset support
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+
+    volumes:
+      # Persistent data storage
+      - gtfs_postgres_data:/var/lib/postgresql/data
+
+      # Init scripts - runs on first startup
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./db/indexes.sql:/docker-entrypoint-initdb.d/02-indexes.sql
+      - ./db/triggers.sql:/docker-entrypoint-initdb.d/03-triggers.sql
+      - ./db/functions.sql:/docker-entrypoint-initdb.d/04-functions.sql
+      - ./db/advanced_functions.sql:/docker-entrypoint-initdb.d/05-advanced-functions.sql
+
+      # Optional: Backup directory
+      - ./backups:/backups
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-gtfs_admin} -d ${POSTGRES_DB:-gtfs_transit}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    networks:
+      - gtfs-network
+
+    # Resource limits (adjust based on your server)
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+        reservations:
+          memory: 2G
+
+  # Optional: pgAdmin for database management
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: gtfs_pgadmin
+    restart: unless-stopped
+
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@gtfs.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+
+    volumes:
+      - gtfs_pgadmin_data:/var/lib/pgadmin
+
+    networks:
+      - gtfs-network
+
+    depends_on:
+      gtfs-postgres:
+        condition: service_healthy
+
+volumes:
+  gtfs_postgres_data:
+    driver: local
+  gtfs_pgadmin_data:
+    driver: local
+
+networks:
+  gtfs-network:
+    driver: bridge

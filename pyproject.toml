@@ -1,16 +1,134 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "gtfs-scraper-viewer-planner"
 version = "0.1.0"
+description = "GTFS scraper, viewer, and multi-waypoint trip planner with PostgreSQL/PostGIS support"
+authors = [
+    {name = "GTFS Platform Team"}
+]
 requires-python = ">=3.10"
 readme = "README.md"
+license = {text = "MIT"}
+keywords = ["gtfs", "transit", "scraper", "planner", "postgis"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    # Core dependencies
+    "beautifulsoup4>=4.14.0",
+    "requests>=2.32.0",
+    "pandas>=2.3.0",
+    "numpy>=2.3.0",
+    
+    # Geospatial
+    "geopandas>=1.1.0",
+    "geopy>=2.4.0",
+    "shapely>=2.1.0",
+    "folium>=0.20.0",
+    
+    # Web UI
+    "streamlit>=1.50.0",
+    "streamlit-folium>=0.25.0",
+    
+    # Data visualization
+    "matplotlib>=3.10.0",
+    "altair>=5.5.0",
+    
+    # Scientific computing
+    "scikit-learn>=1.7.0",
+    "scipy>=1.16.0",
+    
+    # Database (optional dependencies, see below)
+    # sqlalchemy, psycopg2-binary, python-dotenv
+]
+
+[project.optional-dependencies]
+# Database support
+db = [
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.9",
+    "python-dotenv>=1.0.0",
+]
+
+# Development tools
+dev = [
+    "pytest>=8.4.0",
+    "black>=24.0.0",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+]
+
+# All optional dependencies
+all = [
+    "gtfs-scraper-viewer-planner[db,dev]",
+]
+
+[project.scripts]
+gtfs-scraper = "scraper.__main__:main"
+gtfs-viewer = "viewer.__main__:main"
+gtfs-planner = "planner.__main__:main"
+gtfs-database = "database.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/yourusername/gtfs-scraper-viewer-planner"
+Documentation = "https://github.com/yourusername/gtfs-scraper-viewer-planner/blob/main/docs/database.md"
+Repository = "https://github.com/yourusername/gtfs-scraper-viewer-planner"
+Issues = "https://github.com/yourusername/gtfs-scraper-viewer-planner/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["gtfs_source"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"*" = ["*.sql"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  | \.git
+  | \.venv
+  | __pycache__
+  | build
+  | dist
+)/
+'''
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = ["E", "F", "W", "I", "N", "UP"]
+ignore = ["E501"]  # Line too long (handled by black)
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401"]  # Unused imports
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true

@@ -217,3 +217,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Database backups (exclude schema SQL files!)
+backups/
+backup*.sql
+dump*.sql
+export*.sql
+*.sql.gz
+
+# Docker volumes
+postgres_data/

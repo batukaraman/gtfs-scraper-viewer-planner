@@ -1,4 +1,4 @@
-"""GTFS data access — CSV today, database-friendly interface later."""
+"""GTFS data access — PostgreSQL if ``DATABASE_URL`` is set, else CSV only (never mixed)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Protocol, runtime_checkable
 
 import pandas as pd
 
+from gtfs_source import database_url
 from planner.calendar_filter import service_ids_for_date
 
 
@@ -51,8 +52,18 @@ class TransitDataSource(Protocol):
     def shapes(self) -> pd.DataFrame: ...
 
 
+_STOP_TIME_COLS = (
+    "trip_id",
+    "arrival_time",
+    "departure_time",
+    "stop_id",
+    "stop_sequence",
+)
+_SHAPE_COLS = ("shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence")
+
+
 class CsvGtfsRepository:
-    """Load standard GTFS tables from a directory."""
+    """Load standard GTFS tables from a directory (large tables: minimal columns)."""
 
     def __init__(self, gtfs_dir: str | Path):
         self._dir = Path(gtfs_dir)
@@ -87,15 +98,40 @@ class CsvGtfsRepository:
             )
 
         self._agency = pd.read_csv(d / "agency.txt")
-        self._stops = pd.read_csv(d / "stops.txt")
+        self._stops = pd.read_csv(d / "stops.txt", dtype={"stop_id": str})
         self._routes = pd.read_csv(d / "routes.txt")
-        self._trips = pd.read_csv(d / "trips.txt")
-        self._stop_times = pd.read_csv(d / "stop_times.txt")
-        self._transfers = pd.read_csv(transfers_path)
+        self._trips = pd.read_csv(d / "trips.txt", dtype={"trip_id": str, "route_id": str})
+        st_path = d / "stop_times.txt"
+        try:
+            self._stop_times = pd.read_csv(
+                st_path,
+                dtype={"trip_id": str, "stop_id": str},
+                usecols=list(_STOP_TIME_COLS),
+                low_memory=False,
+            )
+        except ValueError:
+            self._stop_times = pd.read_csv(
+                st_path,
+                dtype={"trip_id": str, "stop_id": str},
+                low_memory=False,
+            )
+        self._transfers = pd.read_csv(transfers_path, dtype={"from_stop_id": str, "to_stop_id": str})
         self._calendar = pd.read_csv(d / "calendar.txt")
         freq = d / "frequencies.txt"
         self._frequencies = pd.read_csv(freq) if freq.exists() else pd.DataFrame()
-        self._shapes = pd.read_csv(d / "shapes.txt")
+        shapes_path = d / "shapes.txt"
+        if shapes_path.is_file():
+            try:
+                self._shapes = pd.read_csv(
+                    shapes_path,
+                    dtype={"shape_id": str},
+                    usecols=list(_SHAPE_COLS),
+                    low_memory=False,
+                )
+            except ValueError:
+                self._shapes = pd.read_csv(shapes_path, dtype={"shape_id": str}, low_memory=False)
+        else:
+            self._shapes = pd.DataFrame(columns=list(_SHAPE_COLS))
         self._loaded = True
 
     def service_ids_on(self, on_date: dt.date) -> set[str]:
@@ -138,3 +174,31 @@ class CsvGtfsRepository:
     @property
     def agency(self) -> pd.DataFrame:
         return self._agency
+
+
+def load_transit_repository(gtfs_dir: str | Path = "gtfs"):
+    """Return ``OptimizedPostgresRepository`` if ``DATABASE_URL`` is set, else ``CsvGtfsRepository``.
+
+    Modes are mutually exclusive: with ``DATABASE_URL``, the CSV directory is not read.
+    """
+    url = database_url()
+    if url:
+        from database import OptimizedPostgresRepository
+
+        print("✓ Data source: PostgreSQL (exclusive)")
+        return OptimizedPostgresRepository(url)
+    print(f"✓ Data source: CSV directory {Path(gtfs_dir).resolve()}")
+    return CsvGtfsRepository(gtfs_dir)
+
+
+def create_repository(database_url: str | None = None, gtfs_dir: str | Path = "gtfs"):
+    """Backward-compatible alias. Prefer :func:`load_transit_repository`.
+
+    If ``database_url`` is passed explicitly, uses PostgreSQL with that URL (tests / tooling).
+    Otherwise uses :func:`gtfs_source.database_url` vs ``gtfs_dir``.
+    """
+    if database_url and str(database_url).strip():
+        from database import OptimizedPostgresRepository
+
+        return OptimizedPostgresRepository(str(database_url).strip())
+    return load_transit_repository(gtfs_dir)

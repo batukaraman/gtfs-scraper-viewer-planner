@@ -1,13 +1,17 @@
 """
-Transit routing: time-dependent label setting with walk + scheduled ride legs.
+Transit routing: round-based RAPTOR-style transit legs + GTFS transfer walks.
 
-Uses GTFS transfers for walking, stop_times for vehicles, and a minimum transfer
-buffer when boarding after a ride.
+Uses ``transfers.txt`` footpaths, scheduled trips from preprocess, and the same
+minimum transfer buffer as before when boarding after a ride (no buffer before
+the first vehicle leg).
+
+Complexity is roughly O(K * sum_trip_stops) per query instead of Dijkstra-style
+``heap push per downstream stop`` growth on busy hubs.
 """
 
 from __future__ import annotations
 
-import heapq
+from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple, Union
 
@@ -62,58 +66,81 @@ class Journey:
     total_walk_sec: int
 
 
-def _relax_walk(
+def _relax_foot_layer(
     ctx: RaptorContext,
-    t: int,
-    s: str,
     lg: int,
     best: Dict[Tuple[str, int], int],
     parent: Dict[Tuple[str, int], ParentEntry],
-    q: List[Tuple[int, str, int]],
 ) -> None:
-    for nb, w in ctx.footpaths.get(s, []):
-        nt = t + w
-        key = (nb, lg)
-        if nt < best.get(key, INF):
-            best[key] = nt
-            parent[key] = PWalk(prev_key=(s, lg), t_start=t, t_end=nt, from_stop=s, to_stop=nb)
-            heapq.heappush(q, (nt, nb, lg))
+    q: deque[Tuple[str, int]] = deque()
+    for (s, l), t in best.items():
+        if l == lg and t < INF:
+            q.append((s, t))
+    while q:
+        s, t = q.popleft()
+        if best.get((s, lg), INF) != t:
+            continue
+        for nb, w in ctx.footpaths.get(s, []):
+            nt = t + w
+            key = (nb, lg)
+            if nt < best.get(key, INF):
+                best[key] = nt
+                parent[key] = PWalk(
+                    prev_key=(s, lg),
+                    t_start=t,
+                    t_end=nt,
+                    from_stop=s,
+                    to_stop=nb,
+                )
+                q.append((nb, nt))
 
 
-def _relax_rides(
+def _route_scan_round(
     ctx: RaptorContext,
-    t: int,
-    s: str,
     lg: int,
     min_transfer_sec: int,
     max_vehicle_legs: int,
+    stop_to_routes: Dict[str, Set[str]],
     best: Dict[Tuple[str, int], int],
     parent: Dict[Tuple[str, int], ParentEntry],
-    q: List[Tuple[int, str, int]],
 ) -> None:
-    xfer = 0 if lg == 0 else min_transfer_sec
-    cutoff = t + xfer
     if lg >= max_vehicle_legs:
         return
     nlg = lg + 1
-    for tr, idx in ctx.board_at.get(s, []):
-        if tr.dep_s[idx] < cutoff:
+    need_xfer = 0 if lg == 0 else min_transfer_sec
+
+    marked: Set[str] = set()
+    for (s, l), t in best.items():
+        if l == lg and t < INF:
+            marked.update(stop_to_routes.get(s, ()))
+
+    for route_id in marked:
+        trips = ctx.trips_by_route.get(route_id)
+        if not trips:
             continue
-        for j in range(idx + 1, len(tr.stop_ids)):
-            sj = tr.stop_ids[j]
-            arr = tr.arr_s[j]
-            key = (sj, nlg)
-            if arr < best.get(key, INF):
-                best[key] = arr
-                parent[key] = PRide(
-                    prev_key=(s, lg),
-                    trip_id=tr.trip_id,
-                    board_idx=idx,
-                    alight_idx=j,
-                    t_board=tr.dep_s[idx],
-                    t_alight=arr,
-                )
-                heapq.heappush(q, (arr, sj, nlg))
+        for tr in trips:
+            delta = INF
+            board_idx: Optional[int] = None
+            for i, p in enumerate(tr.stop_ids):
+                arr_here = best.get((p, lg), INF)
+                if arr_here + need_xfer <= tr.dep_s[i]:
+                    delta = tr.arr_s[i]
+                    board_idx = i
+                elif delta < INF:
+                    delta = tr.arr_s[i]
+                if delta >= INF or board_idx is None:
+                    continue
+                key = (p, nlg)
+                if delta < best.get(key, INF):
+                    best[key] = delta
+                    parent[key] = PRide(
+                        prev_key=(tr.stop_ids[board_idx], lg),
+                        trip_id=tr.trip_id,
+                        board_idx=board_idx,
+                        alight_idx=i,
+                        t_board=tr.dep_s[board_idx],
+                        t_alight=tr.arr_s[i],
+                    )
 
 
 def run_routing(
@@ -128,21 +155,25 @@ def run_routing(
 ) -> List[Journey]:
     best: Dict[Tuple[str, int], int] = {}
     parent: Dict[Tuple[str, int], ParentEntry] = {}
-    q: List[Tuple[int, str, int]] = []
+    stop_to_routes = ctx.stop_to_routes
 
     for o in origin_stops:
-        heapq.heappush(q, (dep_sec, o, 0))
         if dep_sec < best.get((o, 0), INF):
             best[(o, 0)] = dep_sec
 
-    while q:
-        t, s, lg = heapq.heappop(q)
-        key = (s, lg)
-        if t != best.get(key, INF):
-            continue
+    _relax_foot_layer(ctx, 0, best, parent)
 
-        _relax_walk(ctx, t, s, lg, best, parent, q)
-        _relax_rides(ctx, t, s, lg, min_transfer_sec, max_vehicle_legs, best, parent, q)
+    for lg in range(max_vehicle_legs):
+        _route_scan_round(
+            ctx,
+            lg,
+            min_transfer_sec,
+            max_vehicle_legs,
+            stop_to_routes,
+            best,
+            parent,
+        )
+        _relax_foot_layer(ctx, lg + 1, best, parent)
 
     candidates: List[Tuple[int, int, str]] = []
     for (stop, legs), tarr in best.items():
@@ -171,11 +202,7 @@ def run_routing(
 
 
 def _find_trip(ctx: RaptorContext, trip_id: str) -> Optional[TripTimetable]:
-    for trs in ctx.trips_by_route.values():
-        for tr in trs:
-            if tr.trip_id == trip_id:
-                return tr
-    return None
+    return ctx.trips_by_trip_id.get(trip_id)
 
 
 def _reconstruct(

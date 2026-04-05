@@ -1,9 +1,10 @@
-"""Write in-memory GTFS tables to CSV files."""
+"""Write in-memory GTFS tables to CSV files and optionally to PostgreSQL."""
 
 from __future__ import annotations
 
 import csv
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -290,3 +291,38 @@ def save_all_files(scraper: Any) -> None:
         _save_calendar_dates(od, scraper.calendar, logger)
 
     logger.info("GTFS files written")
+    
+    # Optionally write to PostgreSQL database
+    database_url = os.getenv("DATABASE_URL")
+    if database_url:
+        logger.info("Database URL found, loading data into PostgreSQL...")
+        try:
+            _write_to_database(od, database_url, logger)
+        except Exception as e:
+            logger.warning(f"Failed to write to database: {e}")
+            logger.warning("CSV files are still available")
+
+
+def _write_to_database(gtfs_dir: Path, database_url: str, logger: logging.Logger) -> None:
+    """Write GTFS CSV files to PostgreSQL database."""
+    try:
+        from database import GTFSLoader
+    except ImportError:
+        logger.warning("Database module not available. Install with: pip install -e '.[db]'")
+        return
+    
+    try:
+        loader = GTFSLoader(gtfs_dir, database_url)
+        results = loader.load_all()
+        
+        success_count = sum(1 for v in results.values() if v)
+        total_count = len(results)
+        
+        if success_count == total_count:
+            logger.info(f"✓ All GTFS data loaded into PostgreSQL ({success_count}/{total_count} files)")
+        else:
+            logger.warning(f"⚠ Partial database load ({success_count}/{total_count} files)")
+            
+    except Exception as e:
+        logger.error(f"Database write failed: {e}")
+        raise
