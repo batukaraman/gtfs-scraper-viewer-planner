@@ -91,8 +91,41 @@ class OptimizedPostgresRepository:
     def gtfs_dir(self) -> Path:
         """Return placeholder path (for interface compatibility)."""
         return self._gtfs_dir
-    
-    def load_for_date(self, on_date: dt.date) -> None:
+
+    def _load_shapes_for_active_trips(self) -> None:
+        """Fill ``self._shapes`` from DB for shape_ids present in ``self._trips``."""
+        if self._trips.empty:
+            self._shapes = pd.DataFrame()
+            return
+        shape_ids = self._trips["shape_id"].dropna().unique().tolist()
+        if not shape_ids:
+            self._shapes = pd.DataFrame()
+            return
+        shapes_query = text("""
+            SELECT
+                shape_id,
+                shape_pt_lat,
+                shape_pt_lon,
+                shape_pt_sequence
+            FROM shapes
+            WHERE shape_id = ANY(:shape_ids)
+            ORDER BY shape_id, shape_pt_sequence
+        """)
+        self._shapes = pd.read_sql(
+            shapes_query,
+            self._engine,
+            params={"shape_ids": shape_ids},
+        )
+
+    def ensure_shapes_loaded(self) -> None:
+        """Load shapes if they were skipped (e.g. planner fast path). Safe to call repeatedly."""
+        if self._loaded_date is None:
+            raise RuntimeError("Must call load_for_date() first")
+        if not self._shapes.empty:
+            return
+        self._load_shapes_for_active_trips()
+
+    def load_for_date(self, on_date: dt.date, *, load_shapes: bool = True) -> None:
         """
         Load GTFS data optimized for a specific date.
         
@@ -101,6 +134,8 @@ class OptimizedPostgresRepository:
         
         Args:
             on_date: Date to load data for
+            load_shapes: If False, skip ``shapes`` (saves a large query); call
+                :meth:`ensure_shapes_loaded` before map polylines are needed.
         """
         if self._loaded_date == on_date:
             if _planner_timing_enabled():
@@ -149,43 +184,35 @@ class OptimizedPostgresRepository:
                 self._trips = pd.DataFrame()
             _planner_timing_log("postgres load: trips", (time.perf_counter() - t0) * 1000)
 
-            trip_ids = self._trips['trip_id'].tolist() if not self._trips.empty else []
-
-            # 4. Load only stop_times for active trips (HUGE OPTIMIZATION!)
+            # 4. stop_times: one round-trip via join (avoids hundreds of sequential batched queries)
             t_st0 = time.perf_counter()
-            if trip_ids:
-                # Batch by 1000 to avoid parameter limits
-                all_stop_times = []
-                for i in range(0, len(trip_ids), 1000):
-                    batch = trip_ids[i:i+1000]
-                    stop_times_query = text("""
-                        SELECT 
-                            trip_id,
-                            stop_id,
-                            stop_sequence,
-                            seconds_to_gtfs_time(arrival_time) as arrival_time,
-                            seconds_to_gtfs_time(departure_time) as departure_time,
-                            stop_headsign,
-                            pickup_type,
-                            drop_off_type,
-                            shape_dist_traveled,
-                            timepoint
-                        FROM stop_times
-                        WHERE trip_id = ANY(:trip_ids)
-                        ORDER BY trip_id, stop_sequence
-                    """)
-                    batch_df = pd.read_sql(
-                        stop_times_query,
-                        self._engine,
-                        params={"trip_ids": batch}
-                    )
-                    all_stop_times.append(batch_df)
-
-                self._stop_times = pd.concat(all_stop_times, ignore_index=True)
+            if active_services:
+                stop_times_query = text("""
+                    SELECT
+                        st.trip_id,
+                        st.stop_id,
+                        st.stop_sequence,
+                        seconds_to_gtfs_time(st.arrival_time) AS arrival_time,
+                        seconds_to_gtfs_time(st.departure_time) AS departure_time,
+                        st.stop_headsign,
+                        st.pickup_type,
+                        st.drop_off_type,
+                        st.shape_dist_traveled,
+                        st.timepoint
+                    FROM stop_times st
+                    INNER JOIN trips t ON st.trip_id = t.trip_id
+                    WHERE t.service_id = ANY(:service_ids)
+                    ORDER BY st.trip_id, st.stop_sequence
+                """)
+                self._stop_times = pd.read_sql(
+                    stop_times_query,
+                    self._engine,
+                    params={"service_ids": active_services},
+                )
             else:
                 self._stop_times = pd.DataFrame()
             _planner_timing_log(
-                f"postgres load: stop_times ({len(trip_ids)} trips, batched)",
+                "postgres load: stop_times (single join on service_ids)",
                 (time.perf_counter() - t_st0) * 1000,
             )
 
@@ -220,44 +247,28 @@ class OptimizedPostgresRepository:
                 self._stops = pd.DataFrame()
             _planner_timing_log("postgres load: stops", (time.perf_counter() - t0) * 1000)
 
-            # 6. Load shapes for active trips (OPTIMIZED!)
+            # 6. Shapes (optional — planner can defer via load_shapes=False)
             t0 = time.perf_counter()
-            if not self._trips.empty:
-                shape_ids = self._trips['shape_id'].dropna().unique().tolist()
-                if shape_ids:
-                    shapes_query = text("""
-                        SELECT 
-                            shape_id,
-                            shape_pt_lat,
-                            shape_pt_lon,
-                            shape_pt_sequence
-                        FROM shapes
-                        WHERE shape_id = ANY(:shape_ids)
-                        ORDER BY shape_id, shape_pt_sequence
-                    """)
-                    self._shapes = pd.read_sql(
-                        shapes_query,
-                        self._engine,
-                        params={"shape_ids": shape_ids}
-                    )
-                else:
-                    self._shapes = pd.DataFrame()
+            if load_shapes:
+                self._load_shapes_for_active_trips()
             else:
                 self._shapes = pd.DataFrame()
             _planner_timing_log("postgres load: shapes", (time.perf_counter() - t0) * 1000)
 
-            # 7. Load frequencies if they exist
+            # 7. Frequencies if they exist (subquery — no huge trip_id array bind)
             t0 = time.perf_counter()
             try:
-                if trip_ids:
+                if active_services:
                     freq_query = text("""
-                        SELECT * FROM frequencies
-                        WHERE trip_id = ANY(:trip_ids)
+                        SELECT f.*
+                        FROM frequencies f
+                        INNER JOIN trips t ON f.trip_id = t.trip_id
+                        WHERE t.service_id = ANY(:service_ids)
                     """)
                     self._frequencies = pd.read_sql(
                         freq_query,
                         self._engine,
-                        params={"trip_ids": trip_ids}
+                        params={"service_ids": active_services},
                     )
                 else:
                     self._frequencies = pd.DataFrame()

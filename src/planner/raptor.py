@@ -66,16 +66,19 @@ class Journey:
     total_walk_sec: int
 
 
-def _relax_foot_layer(
+def _relax_foot_layer_seeded(
     ctx: RaptorContext,
     lg: int,
     best: Dict[Tuple[str, int], int],
     parent: Dict[Tuple[str, int], ParentEntry],
-) -> None:
-    q: deque[Tuple[str, int]] = deque()
-    for (s, l), t in best.items():
-        if l == lg and t < INF:
-            q.append((s, t))
+    seeds: Set[str],
+) -> Set[str]:
+    """Relax transfers at leg ``lg`` starting from ``seeds``; return stops whose label improved."""
+    active = {s for s in seeds if best.get((s, lg), INF) < INF}
+    if not active:
+        return set()
+    updated: Set[str] = set(active)
+    q: deque[Tuple[str, int]] = deque((s, best[(s, lg)]) for s in active)
     while q:
         s, t = q.popleft()
         if best.get((s, lg), INF) != t:
@@ -92,29 +95,28 @@ def _relax_foot_layer(
                     from_stop=s,
                     to_stop=nb,
                 )
+                updated.add(nb)
                 q.append((nb, nt))
+    return updated
 
 
-def _route_scan_round(
+def _route_scan_marked_routes(
     ctx: RaptorContext,
     lg: int,
     min_transfer_sec: int,
     max_vehicle_legs: int,
-    stop_to_routes: Dict[str, Set[str]],
+    marked_route_ids: Set[str],
     best: Dict[Tuple[str, int], int],
     parent: Dict[Tuple[str, int], ParentEntry],
-) -> None:
+) -> Set[str]:
+    """One RAPTOR vehicle round on ``marked_route_ids`` only; return alight stops improved at lg+1."""
     if lg >= max_vehicle_legs:
-        return
+        return set()
     nlg = lg + 1
     need_xfer = 0 if lg == 0 else min_transfer_sec
+    improved_stops: Set[str] = set()
 
-    marked: Set[str] = set()
-    for (s, l), t in best.items():
-        if l == lg and t < INF:
-            marked.update(stop_to_routes.get(s, ()))
-
-    for route_id in marked:
+    for route_id in marked_route_ids:
         trips = ctx.trips_by_route.get(route_id)
         if not trips:
             continue
@@ -141,6 +143,8 @@ def _route_scan_round(
                         t_board=tr.dep_s[board_idx],
                         t_alight=tr.arr_s[i],
                     )
+                    improved_stops.add(p)
+    return improved_stops
 
 
 def run_routing(
@@ -161,19 +165,26 @@ def run_routing(
         if dep_sec < best.get((o, 0), INF):
             best[(o, 0)] = dep_sec
 
-    _relax_foot_layer(ctx, 0, best, parent)
+    foot_updated = _relax_foot_layer_seeded(ctx, 0, best, parent, set(origin_stops))
 
     for lg in range(max_vehicle_legs):
-        _route_scan_round(
-            ctx,
-            lg,
-            min_transfer_sec,
-            max_vehicle_legs,
-            stop_to_routes,
-            best,
-            parent,
+        marked_route_ids: Set[str] = set()
+        for s in foot_updated:
+            marked_route_ids.update(stop_to_routes.get(s, ()))
+        ride_updated = (
+            _route_scan_marked_routes(
+                ctx,
+                lg,
+                min_transfer_sec,
+                max_vehicle_legs,
+                marked_route_ids,
+                best,
+                parent,
+            )
+            if marked_route_ids
+            else set()
         )
-        _relax_foot_layer(ctx, lg + 1, best, parent)
+        foot_updated = _relax_foot_layer_seeded(ctx, lg + 1, best, parent, ride_updated)
 
     candidates: List[Tuple[int, int, str]] = []
     for (stop, legs), tarr in best.items():

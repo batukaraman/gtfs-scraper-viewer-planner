@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from sklearn.neighbors import BallTree
 
-from planner.timeutil import gtfs_time_to_seconds
+from planner.timeutil import gtfs_series_to_seconds
 
 
 class TransitDataSource(Protocol):
@@ -99,15 +99,30 @@ def _exact_haversine_m(lat: float, lon: float, slat: float, slon: float) -> floa
     return r_earth * c
 
 
-def _canonical_route_pattern(
-    trip_ids: List[str], st_by_trip: Dict[str, pd.DataFrame]
+def _trip_id_bounds(trip_id_np: np.ndarray) -> Dict[str, Tuple[int, int]]:
+    """Inclusive start, exclusive end iloc ranges into sorted stop_times."""
+    n = int(trip_id_np.shape[0])
+    if n == 0:
+        return {}
+    ch = np.concatenate([[True], trip_id_np[1:] != trip_id_np[:-1]])
+    starts = np.flatnonzero(ch)
+    ends = np.concatenate([starts[1:], [n]])
+    keys = trip_id_np[starts]
+    return {str(keys[i]): (int(starts[i]), int(ends[i])) for i in range(len(starts))}
+
+
+def _canonical_route_pattern_arrays(
+    trip_ids: List[str],
+    stop_id_np: np.ndarray,
+    trip_bounds: Dict[str, Tuple[int, int]],
 ) -> Optional[List[str]]:
     seq_counter: Counter = Counter()
     for tid in trip_ids:
-        chunk = st_by_trip.get(tid)
-        if chunk is None or chunk.empty:
+        b = trip_bounds.get(tid)
+        if b is None:
             continue
-        seq = tuple(chunk.sort_values("stop_sequence")["stop_id"].astype(str).tolist())
+        lo, hi = b
+        seq = tuple(stop_id_np[lo:hi].tolist())
         if seq:
             seq_counter[seq] += 1
     if not seq_counter:
@@ -136,14 +151,23 @@ def build_raptor_context(
     active_trip_ids = set(trips["trip_id"].astype(str))
 
     st = repo.stop_times.copy()
-    
+
     # Only filter if needed (optimized repo already filtered)
     if not st.empty and not active_trip_ids.issubset(set(st["trip_id"].astype(str))):
         st = st[st["trip_id"].astype(str).isin(active_trip_ids)]
 
-    st_by_trip: Dict[str, pd.DataFrame] = {
-        tid: g for tid, g in st.groupby(st["trip_id"].astype(str), sort=False)
-    }
+    if st.empty:
+        trip_bounds = {}
+        stop_id_np = np.array([], dtype=object)
+        dep_np = np.array([], dtype=np.int64)
+        arr_np = np.array([], dtype=np.int64)
+    else:
+        st = st.sort_values(["trip_id", "stop_sequence"], kind="mergesort")
+        trip_id_np = st["trip_id"].astype(str).to_numpy()
+        stop_id_np = st["stop_id"].astype(str).to_numpy()
+        dep_np = gtfs_series_to_seconds(st["departure_time"])
+        arr_np = gtfs_series_to_seconds(st["arrival_time"])
+        trip_bounds = _trip_id_bounds(trip_id_np)
 
     routes_df = repo.routes
     # One pass over trips — avoid O(|trips|) boolean scans per trip_id.
@@ -169,7 +193,7 @@ def build_raptor_context(
     trips_by_trip_id: Dict[str, TripTimetable] = {}
 
     for route_id, tids in trips_by_route_id.items():
-        pattern = _canonical_route_pattern(tids, st_by_trip)
+        pattern = _canonical_route_pattern_arrays(tids, stop_id_np, trip_bounds)
         if not pattern:
             continue
         route_stops[route_id] = pattern
@@ -191,17 +215,15 @@ def build_raptor_context(
         tt_list: List[TripTimetable] = []
         pat_t = tuple(pattern)
         for tid in tids:
-            chunk = st_by_trip.get(tid)
-            if chunk is None or chunk.empty:
+            bounds = trip_bounds.get(tid)
+            if bounds is None:
                 continue
-            chunk = chunk.sort_values("stop_sequence")
-            seq = chunk["stop_id"].astype(str).tolist()
+            lo, hi = bounds
+            seq = stop_id_np[lo:hi].tolist()
             if tuple(seq) != pat_t:
                 continue
-            dep_s = [
-                gtfs_time_to_seconds(x) for x in chunk["departure_time"].astype(str).tolist()
-            ]
-            arr_s = [gtfs_time_to_seconds(x) for x in chunk["arrival_time"].astype(str).tolist()]
+            dep_s = dep_np[lo:hi].tolist()
+            arr_s = arr_np[lo:hi].tolist()
             if len(dep_s) != len(seq):
                 continue
             shape_id = trip_shape.get(str(tid), "")

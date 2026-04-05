@@ -34,6 +34,7 @@ from planner.journey import (
 from planner.preprocess import RaptorContext, build_raptor_context
 from planner.repository import load_transit_repository, MissingTransfersError
 from planner.raptor import Journey
+from planner.snapshot import raptor_cache_path, save_raptor_snapshot, try_load_raptor_snapshot
 from planner.timeutil import seconds_to_gtfs_time
 from planner.timing import log_phase, timed_phase, timing_enabled
 
@@ -77,14 +78,23 @@ def _cached_routing_bundle(
     else:
         repo.load()
     t2 = time.perf_counter()
-    ctx = build_raptor_context(repo, service_date)
+    snap_path = raptor_cache_path(f"{feed_cache_key}|{service_date.isoformat()}")
+    ctx = try_load_raptor_snapshot(snap_path, repo, service_date)
+    t_snap = time.perf_counter()
+    snap_hit = ctx is not None
+    if ctx is None:
+        ctx = build_raptor_context(repo, service_date)
+        save_raptor_snapshot(snap_path, ctx, repo, service_date)
     t3 = time.perf_counter()
     shapes = _shapes_dict_from_dataframe(repo.shapes)
     t4 = time.perf_counter()
     if timing_enabled():
         log_phase("routing_bundle(csv): create_repo", (t1 - t0) * 1000)
         log_phase("routing_bundle(csv): load_gtfs", (t2 - t1) * 1000)
-        log_phase("routing_bundle(csv): build_raptor_context", (t3 - t2) * 1000)
+        if snap_hit:
+            log_phase("routing_bundle(csv): raptor_context snapshot load", (t_snap - t2) * 1000)
+        else:
+            log_phase("routing_bundle(csv): raptor_context build+save", (t3 - t_snap) * 1000)
         log_phase("routing_bundle(csv): shapes_dict", (t4 - t3) * 1000)
         log_phase("routing_bundle(csv): total", (t4 - t0) * 1000)
     return ctx, shapes
@@ -100,20 +110,28 @@ def _cached_postgres_routing_bundle(
     service_date: dt.date,
 ) -> Tuple[RaptorContext, Dict[str, List[Tuple[float, float]]], Any]:
     """PostgreSQL: **single** repository — load once, build context, reuse for PostGIS snap."""
-    _ = url_fingerprint
     t0 = time.perf_counter()
     repo = load_transit_repository(".")
     t1 = time.perf_counter()
-    repo.load_for_date(service_date)
+    repo.load_for_date(service_date, load_shapes=False)
     t2 = time.perf_counter()
-    ctx = build_raptor_context(repo, service_date)
+    snap_path = raptor_cache_path(f"{url_fingerprint}|{service_date.isoformat()}")
+    ctx = try_load_raptor_snapshot(snap_path, repo, service_date)
+    t_snap = time.perf_counter()
+    snap_hit = ctx is not None
+    if ctx is None:
+        ctx = build_raptor_context(repo, service_date)
+        save_raptor_snapshot(snap_path, ctx, repo, service_date)
     t3 = time.perf_counter()
     shapes = _shapes_dict_from_dataframe(repo.shapes)
     t4 = time.perf_counter()
     if timing_enabled():
         log_phase("routing_bundle(pg): create_repo", (t1 - t0) * 1000)
         log_phase("routing_bundle(pg): load_for_date", (t2 - t1) * 1000)
-        log_phase("routing_bundle(pg): build_raptor_context", (t3 - t2) * 1000)
+        if snap_hit:
+            log_phase("routing_bundle(pg): raptor_context snapshot load", (t_snap - t2) * 1000)
+        else:
+            log_phase("routing_bundle(pg): raptor_context build+save", (t3 - t_snap) * 1000)
         log_phase("routing_bundle(pg): shapes_dict", (t4 - t3) * 1000)
         log_phase("routing_bundle(pg): total", (t4 - t0) * 1000)
     return ctx, shapes, repo
@@ -314,7 +332,13 @@ def _render_plan_results(
             f"final arrival **{seconds_to_gtfs_time(merged.arrival_sec)}**"
         )
         if st.checkbox("Show route map", value=False, key="show_planner_route_map"):
-            fm = _journey_map(ctx, merged, shapes, waypoints)
+            map_shapes = shapes
+            pg_repo = st.session_state.get("_planner_pg_repo")
+            if pg_repo is not None and not map_shapes:
+                if hasattr(pg_repo, "ensure_shapes_loaded"):
+                    pg_repo.ensure_shapes_loaded()
+                map_shapes = _shapes_dict_from_dataframe(pg_repo.shapes)
+            fm = _journey_map(ctx, merged, map_shapes, waypoints)
             st_folium(fm, width=None, height=520, returned_objects=[])
 
 
@@ -488,8 +512,10 @@ def main() -> None:
                 ctx, shapes, pg_repo = _cached_postgres_routing_bundle(
                     database_url_fingerprint(), d
                 )
+            st.session_state["_planner_pg_repo"] = pg_repo
             nearby_fn = _make_nearby_stops_fn(pg_repo, ctx)
         else:
+            st.session_state.pop("_planner_pg_repo", None)
             if show_network_spinner:
                 with st.spinner("Building network…"):
                     ctx, shapes = _cached_routing_bundle(feed_cache_key, d, gtfs_for_load)
