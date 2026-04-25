@@ -1,0 +1,68 @@
+# GTFS Pipeline Configuration
+# Her ülke ve şehir için GTFS kaynakları ve OSM ayarları
+
+countries:
+  turkey:
+    name: Türkiye
+    osm:
+      source: https://download.geofabrik.de/europe/turkey-latest.osm.pbf
+      filename: turkey-latest.osm.pbf
+
+    cities:
+      istanbul:
+        name: İstanbul
+        timezone: Europe/Istanbul
+        language: tr
+        bbox:
+          min_lon: 27.90
+          min_lat: 40.72
+          max_lon: 30.12
+          max_lat: 41.58
+        sources:
+          - type: easyway
+            city_code: istanbul
+            base_url: https://tr.easyway.info/ajax/tr
+        otp:
+          memory: 8g
+          port: 8080
+
+      # Örnek: Yeni şehir eklemek için
+      # ankara:
+      #   name: Ankara
+      #   timezone: Europe/Istanbul
+      #   language: tr
+      #   bbox:
+      #     min_lon: 32.50
+      #     min_lat: 39.70
+      #     max_lon: 33.10
+      #     max_lat: 40.10
+      #   sources:
+      #     - type: easyway
+      #       city_code: ankara
+      #       base_url: https://tr.easyway.info/ajax/tr
+      #   otp:
+      #     memory: 4g
+      #     port: 8081
+
+# Örnek: Başka ülke eklemek için
+# germany:
+#   name: Germany
+#   osm:
+#     source: https://download.geofabrik.de/europe/germany-latest.osm.pbf
+#     filename: germany-latest.osm.pbf
+#   cities:
+#     berlin:
+#       name: Berlin
+#       timezone: Europe/Berlin
+#       language: de
+#       bbox:
+#         min_lon: 13.08
+#         min_lat: 52.33
+#         max_lon: 13.77
+#         max_lat: 52.68
+#       sources:
+#         - type: static_gtfs
+#           url: https://example.com/berlin-gtfs.zip
+#       otp:
+#         memory: 6g
+#         port: 8082

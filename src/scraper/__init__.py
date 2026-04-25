@@ -1,5 +1,3 @@
-"""EasyWay → GTFS scraper."""
+"""GTFS Scraper Pipeline - Multi-city transit data collection and OTP integration."""
 
-from .core import GTFSScraper
-
-__all__ = ["GTFSScraper"]
+__version__ = "1.0.0"
