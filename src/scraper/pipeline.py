@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import csv
 import logging
+import re
 import shutil
+import zipfile
 from pathlib import Path
 from typing import Callable
 
@@ -262,6 +265,10 @@ class Pipeline:
         if not (city_dir / "gtfs.zip").exists():
             raise FileNotFoundError(f"GTFS not found: {city_dir}/gtfs.zip")
 
+        sanitize_report = self._sanitize_gtfs_for_otp(city_dir)
+        if sanitize_report:
+            logger.info("GTFS pre-build sanitize report: %s", sanitize_report)
+
         osm_files = list(city_dir.glob("*.osm.pbf"))
         if not osm_files:
             raise FileNotFoundError(f"No OSM file found in {city_dir}")
@@ -284,6 +291,8 @@ class Pipeline:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=7200,
             )
 
@@ -303,6 +312,175 @@ class Pipeline:
         except subprocess.TimeoutExpired:
             logger.error("OTP build timed out")
             return False
+
+    def _sanitize_gtfs_for_otp(self, city_dir: Path) -> dict[str, dict[str, int]]:
+        """Normalize GTFS text files to avoid CSV shape issues before OTP build."""
+        gtfs_dir = city_dir / "gtfs"
+        if not gtfs_dir.exists():
+            logger.warning("GTFS directory not found for sanitize: %s", gtfs_dir)
+            return {}
+
+        report: dict[str, dict[str, int]] = {}
+        allowed_route_types = {"0", "1", "2", "3", "4", "5", "6", "7", "11", "12"}
+
+        def _normalize_coordinate(raw: str, kind: str) -> str | None:
+            """Normalize malformed lat/lon like '410.191.700.005.564' -> '41.0191700005564'."""
+            txt = (raw or "").strip().replace(",", ".")
+            min_val, max_val = (39.0, 42.5) if kind == "lat" else (26.0, 31.5)
+
+            def _is_valid(v: str) -> bool:
+                try:
+                    x = float(v)
+                except (TypeError, ValueError):
+                    return False
+                return min_val <= x <= max_val
+
+            if _is_valid(txt):
+                return str(float(txt))
+
+            digits = re.sub(r"\D", "", txt)
+            if not digits:
+                return None
+
+            # Most malformed Istanbul coords recover with 2-digit integer part.
+            for split in (2, 3, 1):
+                if len(digits) <= split:
+                    continue
+                candidate = f"{digits[:split]}.{digits[split:]}"
+                if _is_valid(candidate):
+                    return str(float(candidate))
+
+            return None
+
+        for path in sorted(gtfs_dir.glob("*.txt")):
+            with path.open("r", encoding="utf-8", newline="") as f:
+                rows = list(csv.reader(f))
+
+            if not rows:
+                report[path.name] = {"input_rows": 0, "output_rows": 0, "fixed_width": 0, "dropped": 0}
+                continue
+
+            header = rows[0]
+            cols = len(header)
+            idx = {name: i for i, name in enumerate(header)}
+
+            out = [header]
+            fixed_width = 0
+            fixed_required = 0
+            dropped = 0
+
+            for row in rows[1:]:
+                if len(row) > cols:
+                    row = row[:cols - 1] + [",".join(row[cols - 1:])]
+                    fixed_width += 1
+                elif len(row) < cols:
+                    row = row + [""] * (cols - len(row))
+                    fixed_width += 1
+
+                # file-specific required field repairs
+                if path.name == "routes.txt":
+                    route_id_i = idx.get("route_id")
+                    route_type_i = idx.get("route_type")
+                    short_i = idx.get("route_short_name")
+                    long_i = idx.get("route_long_name")
+
+                    if route_id_i is not None and not row[route_id_i].strip():
+                        dropped += 1
+                        continue
+
+                    if route_type_i is not None and row[route_type_i].strip() not in allowed_route_types:
+                        row[route_type_i] = "3"
+                        fixed_required += 1
+
+                    if (
+                        short_i is not None
+                        and long_i is not None
+                        and not row[short_i].strip()
+                        and not row[long_i].strip()
+                    ):
+                        dropped += 1
+                        continue
+
+                elif path.name == "stops.txt":
+                    stop_id_i = idx.get("stop_id")
+                    stop_name_i = idx.get("stop_name")
+                    lat_i = idx.get("stop_lat")
+                    lon_i = idx.get("stop_lon")
+
+                    if stop_id_i is not None and not row[stop_id_i].strip():
+                        dropped += 1
+                        continue
+
+                    if stop_name_i is not None and not row[stop_name_i].strip():
+                        row[stop_name_i] = "Unknown Stop"
+                        fixed_required += 1
+
+                    if lat_i is not None:
+                        lat_val = _normalize_coordinate(row[lat_i], "lat")
+                        if lat_val is None:
+                            lat_val = "41.0082"
+                        if row[lat_i] != lat_val:
+                            row[lat_i] = lat_val
+                            fixed_required += 1
+
+                    if lon_i is not None:
+                        lon_val = _normalize_coordinate(row[lon_i], "lon")
+                        if lon_val is None:
+                            lon_val = "28.9784"
+                        if row[lon_i] != lon_val:
+                            row[lon_i] = lon_val
+                            fixed_required += 1
+
+                    if lat_i is not None and not row[lat_i].strip():
+                        row[lat_i] = "41.0082"
+                        fixed_required += 1
+                    if lon_i is not None and not row[lon_i].strip():
+                        row[lon_i] = "28.9784"
+                        fixed_required += 1
+
+                elif path.name == "trips.txt":
+                    missing_trip_required = any(
+                        req in idx and not row[idx[req]].strip()
+                        for req in ("trip_id", "route_id", "service_id")
+                    )
+                    if missing_trip_required:
+                        dropped += 1
+                        continue
+
+                elif path.name == "stop_times.txt":
+                    missing_stop_time_required = any(
+                        req in idx and not row[idx[req]].strip()
+                        for req in ("trip_id", "stop_id", "stop_sequence")
+                    )
+                    if missing_stop_time_required:
+                        dropped += 1
+                        continue
+
+                elif path.name == "calendar.txt":
+                    service_id_i = idx.get("service_id")
+                    if service_id_i is not None and not row[service_id_i].strip():
+                        dropped += 1
+                        continue
+
+                out.append(row)
+
+            with path.open("w", encoding="utf-8", newline="") as f:
+                csv.writer(f).writerows(out)
+
+            report[path.name] = {
+                "input_rows": len(rows) - 1,
+                "output_rows": len(out) - 1,
+                "fixed_width": fixed_width,
+                "fixed_required": fixed_required,
+                "dropped": dropped,
+            }
+
+        zip_path = city_dir / "gtfs.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            for p in sorted(gtfs_dir.glob("*.txt")):
+                z.write(p, arcname=p.name)
+
+        return report
 
     def list_cities(self) -> list[dict]:
         """List all configured cities."""
