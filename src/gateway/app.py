@@ -59,6 +59,7 @@ class StatusResponse(BaseModel):
 
 config: GatewayConfig | None = None
 container_manager: ContainerManager | None = None
+plan_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 def get_config_path() -> Path:
@@ -148,6 +149,7 @@ async def list_cities():
     return {
         city_id: {
             "name": city.name,
+            "tier": city.tier,
             "bbox": {
                 "min_lon": city.bbox[0],
                 "min_lat": city.bbox[1],
@@ -164,6 +166,7 @@ async def list_cities():
 async def plan_trip(
     request: PlanRequest,
     city: str | None = Query(None, description="City ID (auto-detected if not provided)"),
+    prefer_fresh: bool = Query(False, description="Bypass cache and force fresh OTP query"),
 ):
     """Plan a transit trip.
     
@@ -194,12 +197,23 @@ async def plan_trip(
                        "Please specify city parameter or ensure coordinates are within a configured city's bbox.",
             )
     
+    cache_key = _build_cache_key(city_config.id, request)
+    cached = _cache_get(cache_key)
+    if cached and not prefer_fresh:
+        request_time_ms = int((time.time() - start_time) * 1000)
+        return PlanResponse(
+            city=city_config.id,
+            request_time_ms=request_time_ms,
+            data=cached,
+        )
+
     success, message, port = await container_manager.ensure_running(city_config.id)
     
     if not success:
         raise HTTPException(status_code=503, detail=message)
     
     otp_response = await _forward_to_otp(port, request)
+    _cache_put(cache_key, otp_response)
     
     request_time_ms = int((time.time() - start_time) * 1000)
     
@@ -208,6 +222,26 @@ async def plan_trip(
         request_time_ms=request_time_ms,
         data=otp_response,
     )
+
+
+@app.post("/cities/{city_id}/warmup")
+async def warmup_city(city_id: str):
+    """Warm up city OTP container in advance."""
+    city = config.get_city(city_id)
+    if city is None:
+        raise HTTPException(status_code=404, detail=f"Unknown city: {city_id}")
+
+    success, message, port = await container_manager.ensure_running(city_id)
+    if not success:
+        raise HTTPException(status_code=503, detail=message)
+
+    return {
+        "status": "ready",
+        "city": city_id,
+        "port": port,
+        "tier": city.tier,
+        "message": message,
+    }
 
 
 async def _forward_to_otp(port: int, request: PlanRequest) -> dict:
@@ -328,6 +362,35 @@ def main():
     port = int(os.environ.get("GATEWAY_PORT", "8000"))
     
     uvicorn.run(app, host=host, port=port)
+
+
+def _build_cache_key(city_id: str, request: PlanRequest) -> str:
+    """Build deterministic cache key with rounded coordinates."""
+    date = request.date or datetime.now().strftime("%Y-%m-%d")
+    time_str = request.time or datetime.now().strftime("%H:%M")
+    return (
+        f"{city_id}|"
+        f"{request.origin.lat:.5f},{request.origin.lon:.5f}|"
+        f"{request.destination.lat:.5f},{request.destination.lon:.5f}|"
+        f"{date}|{time_str}|{request.arrive_by}|{request.mode}|{request.num_itineraries}"
+    )
+
+
+def _cache_get(key: str) -> dict[str, Any] | None:
+    item = plan_cache.get(key)
+    if item is None:
+        return None
+    expires_at, payload = item
+    if expires_at <= datetime.now().timestamp():
+        plan_cache.pop(key, None)
+        return None
+    return payload
+
+
+def _cache_put(key: str, payload: dict[str, Any]) -> None:
+    ttl = config.plan_cache_ttl_seconds
+    expires_at = datetime.now().timestamp() + max(ttl, 1)
+    plan_cache[key] = (expires_at, payload)
 
 
 if __name__ == "__main__":

@@ -8,8 +8,9 @@ Multi-city GTFS data collection pipeline with on-demand OpenTripPlanner integrat
 - **Multi-city support**: Configure and process multiple cities independently
 - **Source merging**: Combine data from multiple sources per city
 - **Automatic OSM preparation**: Download country-level OSM and extract city bounding boxes
-- **On-demand OTP**: Containers start automatically when needed, stop when idle
+- **Tiered OTP runtime**: `hot` cities stay online, `warm` cities are prewarmed by time windows, `cold` cities start on-demand
 - **Unified API**: Single `/api/plan` endpoint routes to correct city automatically
+- **Built-in caching**: Short TTL plan cache for repeated searches
 - **Extensible**: Easy to add new data sources
 
 ## Architecture
@@ -23,14 +24,14 @@ Multi-city GTFS data collection pipeline with on-demand OpenTripPlanner integrat
          ▼
 ┌─────────────────┐
 │  Transit API    │ ← Koordinatlardan şehri tespit
-│  Gateway :8000  │ ← On-demand container yönetimi
+│  Gateway :8000  │ ← Tiered container + cache yönetimi
 └────────┬────────┘
          │
     ┌────┴────┬────────┐
     ▼         ▼        ▼
 ┌───────┐ ┌───────┐ ┌───────┐
-│ OTP   │ │ OTP   │ │ OTP   │  ← Idle olunca otomatik kapanır
-│ :8080 │ │ :8081 │ │ :8082 │     (varsayılan: 5 dakika)
+│ OTP   │ │ OTP   │ │ OTP   │  ← tier politikasına göre açık/kapalı
+│ :8080 │ │ :8081 │ │ :8082 │     (hot/warm/cold)
 │İst.   │ │Ankara │ │Berlin │
 └───────┘ └───────┘ └───────┘
 ```
@@ -145,8 +146,8 @@ curl -X POST http://localhost:8000/api/plan \
   }'
 ```
 
-**First request takes 30-60 seconds** (OTP container starting)
-Subsequent requests: ~1-2 seconds
+Cold cities may take 20-60 seconds on first request (OTP startup).  
+Hot/warm cities and cache hits typically respond in ~1-5 seconds.
 
 ---
 
@@ -273,6 +274,7 @@ List available cities.
 {
   "istanbul": {
     "name": "İstanbul",
+    "tier": "hot",
     "bbox": {
       "min_lon": 27.9,
       "min_lat": 40.72,
@@ -297,6 +299,7 @@ Get container status.
     "istanbul": {
       "status": "running",
       "port": 8080,
+      "tier": "hot",
       "idle_seconds": 45
     }
   },
@@ -307,6 +310,10 @@ Get container status.
 ### GET /health
 
 Health check endpoint. Returns `{"status": "ok"}`.
+
+### POST /cities/{city_id}/warmup
+
+Warm up a city's OTP container proactively (useful right after user city selection).
 
 ---
 
@@ -549,12 +556,28 @@ stop_id = f"ibb_{original_id}"
 
 ### Container Management Settings
 
-In `src/gateway/config.py`:
+In `config/cities.yaml` (`gateway` section):
 
 ```python
-container_idle_timeout: int = 300      # Stop after 5 min idle
-container_startup_timeout: int = 300   # Wait 5 min for startup (large graphs)
-health_check_interval: int = 5         # Health check every 5 sec
+container_idle_timeout: 300       # cold-tier idle timeout
+warm_city_idle_timeout: 1800      # warm-tier idle timeout
+container_startup_timeout: 300    # startup health wait
+health_check_interval: 5          # health probe interval
+prewarm_poll_interval: 60         # prewarm policy loop
+plan_cache_ttl_seconds: 90        # /api/plan cache TTL
+```
+
+Per-city runtime policy (`otp` section):
+
+```yaml
+otp:
+  port: 8080
+  memory: 8g
+  tier: hot            # hot | warm | cold
+  idle_timeout: 1200   # optional override per city
+  prewarm_windows:     # for warm tier (optional)
+    - "07:00-10:00"
+    - "17:00-20:00"
 ```
 
 ---

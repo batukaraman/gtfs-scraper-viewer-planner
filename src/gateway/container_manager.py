@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Callable
+from dataclasses import dataclass
+from datetime import datetime
 
 import docker
 from docker.errors import NotFound, APIError
@@ -36,6 +36,7 @@ class ContainerManager:
         self.states: dict[str, ContainerState] = {}
         self.locks: dict[str, asyncio.Lock] = {}
         self._cleanup_task: asyncio.Task | None = None
+        self._prewarm_task: asyncio.Task | None = None
         
         for city_id in config.cities:
             self.states[city_id] = ContainerState(city_id=city_id)
@@ -44,6 +45,14 @@ class ContainerManager:
     async def start(self) -> None:
         """Start the container manager background tasks."""
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        self._prewarm_task = asyncio.create_task(self._prewarm_loop())
+
+        # Start hot-tier cities immediately to avoid cold starts.
+        hot_cities = [city.id for city in self.config.cities.values() if city.tier == "hot"]
+        if hot_cities:
+            logger.info("Prewarming hot cities on startup: %s", ", ".join(hot_cities))
+            await asyncio.gather(*(self.ensure_running(city_id) for city_id in hot_cities))
+
         logger.info("Container manager started")
     
     async def stop(self) -> None:
@@ -52,6 +61,12 @@ class ContainerManager:
             self._cleanup_task.cancel()
             try:
                 await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        if self._prewarm_task:
+            self._prewarm_task.cancel()
+            try:
+                await self._prewarm_task
             except asyncio.CancelledError:
                 pass
         
@@ -203,8 +218,15 @@ class ContainerManager:
                 now = time.time()
                 for city_id, state in self.states.items():
                     if state.status == "running":
+                        city = self.config.get_city(city_id)
+                        if city is None:
+                            continue
+                        idle_timeout = self._resolve_idle_timeout(city)
+                        if idle_timeout is None:
+                            # hot-tier city should stay online
+                            continue
                         idle_time = now - state.last_used
-                        if idle_time > self.config.container_idle_timeout:
+                        if idle_time > idle_timeout:
                             logger.info(
                                 "Container %s idle for %ds, stopping",
                                 city_id,
@@ -217,6 +239,32 @@ class ContainerManager:
                 raise
             except Exception as e:
                 logger.error("Cleanup loop error: %s", e)
+
+    async def _prewarm_loop(self) -> None:
+        """Background task to keep hot/warm cities ready based on policy."""
+        while True:
+            try:
+                await asyncio.sleep(self.config.prewarm_poll_interval)
+                now = datetime.now()
+                for city in self.config.cities.values():
+                    if city.should_prewarm_now(now):
+                        success, message, _ = await self.ensure_running(city.id)
+                        if not success:
+                            logger.warning("Prewarm failed for %s: %s", city.id, message)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("Prewarm loop error: %s", e)
+
+    def _resolve_idle_timeout(self, city: CityOTP) -> int | None:
+        """Resolve per-city idle timeout. None means never stop automatically."""
+        if city.idle_timeout is not None:
+            return city.idle_timeout
+        if city.tier == "hot":
+            return None
+        if city.tier == "warm":
+            return self.config.warm_city_idle_timeout
+        return self.config.container_idle_timeout
     
     def get_status(self) -> dict[str, dict]:
         """Get status of all containers."""
@@ -224,6 +272,7 @@ class ContainerManager:
             city_id: {
                 "status": state.status,
                 "port": state.port,
+                "tier": self.config.cities[city_id].tier,
                 "last_used": state.last_used,
                 "idle_seconds": int(time.time() - state.last_used) if state.last_used else 0,
             }

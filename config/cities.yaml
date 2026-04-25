@@ -1,6 +1,20 @@
 # GTFS Pipeline Configuration
 # Her ülke ve şehir için GTFS kaynakları ve OSM ayarları
 
+gateway:
+  # Base idle timeout for cold-tier cities (seconds)
+  container_idle_timeout: 300
+  # Longer idle timeout for warm-tier cities (seconds)
+  warm_city_idle_timeout: 1800
+  # OTP startup max wait
+  container_startup_timeout: 300
+  # Health probe interval for starting containers
+  health_check_interval: 5
+  # How often prewarm policy is evaluated
+  prewarm_poll_interval: 60
+  # In-memory plan response cache TTL
+  plan_cache_ttl_seconds: 90
+
 countries:
   turkey:
     name: Türkiye
@@ -25,6 +39,11 @@ countries:
         otp:
           memory: 8g
           port: 8080
+          tier: hot
+          # Optional for warm tier: ["07:00-10:00", "17:00-20:00"]
+          # prewarm_windows:
+          #   - "07:00-10:00"
+          #   - "17:00-20:00"
 
       # Örnek: Yeni şehir eklemek için
       # ankara:
